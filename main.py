@@ -430,7 +430,7 @@ ALERT_STYLES = {
 }
 
 def build_discord_embed(alert_data, claude_analysis="", claude_confidence="", is_test=False):
-    """Build a rich Discord embed for the alert"""
+    """Build a rich Discord embed for the alert, optimised for mobile readability"""
     atype = alert_data.get("alert_type", "")
     style = ALERT_STYLES.get(atype, ALERT_STYLES["PARSE_ERROR"])
     direction = alert_data.get("direction", "")
@@ -451,19 +451,15 @@ def build_discord_embed(alert_data, claude_analysis="", claude_confidence="", is
     title = f"{style['emoji']}  {style['label']}"
     if is_test:
         title = f"\U0001f9ea  TEST \u2014 {title}"
+
+    # ── Main description: direction + price on one prominent line ──────────
     price = alert_data.get("price", 0)
     price_str = f"${price:,.2f}" if price else "\u2014"
     desc_lines = []
     if direction:
-        desc_lines.append(f"**{dir_emoji} {dir_label}**  \u2502  **ES @ {price_str}**")
+        desc_lines.append(f"## {dir_emoji} {dir_label}  \u2502  ES @ {price_str}")
     elif price:
-        desc_lines.append(f"**ES @ {price_str}**")
-
-    tl_spread = alert_data.get("tl_spread", 0)
-    tl_state = alert_data.get("tl_state", "")
-    if tl_spread or tl_state:
-        tl_emoji = "\U0001f4c8" if tl_spread >= 0 else "\U0001f4c9"
-        desc_lines.append(f"{tl_emoji} TL: **{tl_spread:+.1f}pts** {tl_state}")
+        desc_lines.append(f"## ES @ {price_str}")
 
     verdict = alert_data.get("verdict", "")
     if verdict:
@@ -472,37 +468,78 @@ def build_discord_embed(alert_data, claude_analysis="", claude_confidence="", is
     description = "\n".join(desc_lines)
 
     fields = []
+
+    # ── Section 1: Technical indicators — inline pairs (RSI+ADX, VIX+CL) ──
     rsi = alert_data.get("rsi", 0)
     adx = alert_data.get("adx", 0)
-    if rsi or adx:
-        rsi_bar = "\U0001f7e2" if 40 <= rsi <= 60 else "\U0001f7e1" if 30 <= rsi <= 70 else "\U0001f534"
-        adx_bar = "\U0001f4aa" if adx >= 25 else "\U0001f4a4"
-        fields.append({"name": "\U0001f4ca RSI", "value": f"{rsi_bar} **{rsi:.0f}**", "inline": True})
-        fields.append({"name": "\U0001f4aa ADX", "value": f"{adx_bar} **{adx:.0f}**", "inline": True})
-
     vix = alert_data.get("vix_rsi", 0)
-    cl = alert_data.get("compare_rsi", 0)
-    if vix or cl:
-        vix_emoji = "\U0001f534" if vix > 60 else "\U0001f7e1" if vix > 40 else "\U0001f7e2"
-        fields.append({"name": "\U0001f30a VIX", "value": f"{vix_emoji} **{vix:.0f}**", "inline": True})
-        fields.append({"name": "\U0001f6e2\ufe0f CL", "value": f"**{cl:.0f}**", "inline": True})
+    cl  = alert_data.get("compare_rsi", 0)
 
-    daily = alert_data.get("daily_pnl", 0)
+    has_technicals = rsi or adx or vix or cl
+    if has_technicals:
+        # Blank spacer keeps the section visually separated on mobile
+        fields.append({"name": "\u200b", "value": "**\U0001f4ca Technicals**", "inline": False})
+
+        if rsi or adx:
+            rsi_bar = "\U0001f7e2" if 40 <= rsi <= 60 else "\U0001f7e1" if 30 <= rsi <= 70 else "\U0001f534"
+            adx_bar = "\U0001f4aa" if adx >= 25 else "\U0001f4a4"
+            fields.append({"name": "RSI", "value": f"{rsi_bar} **{rsi:.0f}**", "inline": True})
+            fields.append({"name": "ADX", "value": f"{adx_bar} **{adx:.0f}**", "inline": True})
+            # Third invisible field forces the pair to its own row on mobile
+            fields.append({"name": "\u200b", "value": "\u200b", "inline": True})
+
+        if vix or cl:
+            vix_emoji = "\U0001f534" if vix > 60 else "\U0001f7e1" if vix > 40 else "\U0001f7e2"
+            fields.append({"name": "VIX RSI", "value": f"{vix_emoji} **{vix:.0f}**", "inline": True})
+            fields.append({"name": "CL RSI", "value": f"**{cl:.0f}**", "inline": True})
+            fields.append({"name": "\u200b", "value": "\u200b", "inline": True})
+
+    # ── Section 2: TL spread — non-inline for full-width readability ───────
+    tl_spread = alert_data.get("tl_spread", 0)
+    tl_state  = alert_data.get("tl_state", "")
+    if tl_spread or tl_state:
+        tl_emoji = "\U0001f4c8" if tl_spread >= 0 else "\U0001f4c9"
+        fields.append({
+            "name": f"{tl_emoji} TL Spread",
+            "value": f"**{tl_spread:+.1f} pts** \u2014 {tl_state}",
+            "inline": False,
+        })
+
+    # ── Section 3: P&L — each metric on its own non-inline row ────────────
+    daily  = alert_data.get("daily_pnl", 0)
     weekly = alert_data.get("weekly_pnl", 0)
-    total = alert_data.get("total_pnl", 0)
-    if daily or weekly or total:
-        d_emoji = "\u2705" if daily >= 0 else "\u274c"
-        w_emoji = "\u2705" if weekly >= 0 else "\u274c"
-        pnl_text = f"{d_emoji} **{daily:+.1f}** today\n{w_emoji} **{weekly:+.1f}** week"
-        fields.append({"name": "\U0001f4b0 P&L (pts)", "value": pnl_text, "inline": True})
+    total  = alert_data.get("total_pnl", 0)
+    exit_pts = alert_data.get("exit_pts", 0)
+
+    has_pnl = daily or weekly or total or exit_pts
+    if has_pnl:
+        fields.append({"name": "\u200b", "value": "**\U0001f4b0 P&L**", "inline": False})
+
+        if daily or weekly:
+            d_emoji = "\u2705" if daily >= 0 else "\u274c"
+            w_emoji = "\u2705" if weekly >= 0 else "\u274c"
+            fields.append({
+                "name": "Today / Week",
+                "value": f"{d_emoji} **{daily:+.1f} pts** \u2003 {w_emoji} **{weekly:+.1f} pts**",
+                "inline": False,
+            })
+
         if total:
             t_emoji = "\U0001f3c6" if total >= 0 else "\U0001f4c9"
-            fields.append({"name": "\U0001f3af Total", "value": f"{t_emoji} **{total:+.1f}pts**", "inline": True})
+            fields.append({
+                "name": "Total",
+                "value": f"{t_emoji} **{total:+.1f} pts**",
+                "inline": False,
+            })
 
-    exit_pts = alert_data.get("exit_pts", 0)
-    if exit_pts:
-        e_emoji = "\u2705" if exit_pts > 0 else "\u274c"
-        fields.append({"name": "\U0001f3af Exit", "value": f"{e_emoji} **{exit_pts:+.1f}pts**", "inline": True})
+        if exit_pts:
+            e_emoji = "\u2705" if exit_pts > 0 else "\u274c"
+            fields.append({
+                "name": "Exit",
+                "value": f"{e_emoji} **{exit_pts:+.1f} pts**",
+                "inline": False,
+            })
+
     embed = {
         "title": title,
         "description": description,
@@ -513,18 +550,23 @@ def build_discord_embed(alert_data, claude_analysis="", claude_confidence="", is
 
     embeds = [embed]
 
+    # ── Claude analysis embed — mobile-friendly single-column layout ───────
     if claude_analysis:
         if claude_confidence == "HIGH":
-            c_color, c_emoji, c_bar = 3066993, "\U0001f7e2", "\u2588\u2588\u2588\u2588\u2588"
+            c_color, c_emoji, c_label = 3066993,  "\U0001f7e2", "HIGH CONFIDENCE"
         elif claude_confidence == "MEDIUM":
-            c_color, c_emoji, c_bar = 15844367, "\U0001f7e1", "\u2588\u2588\u2588\u2591\u2591"
+            c_color, c_emoji, c_label = 15844367, "\U0001f7e1", "MEDIUM CONFIDENCE"
         else:
-            c_color, c_emoji, c_bar = 15158332, "\U0001f534", "\u2588\u2591\u2591\u2591\u2591"
+            c_color, c_emoji, c_label = 15158332, "\U0001f534", "LOW CONFIDENCE"
 
         claude_embed = {
-            "description": f"**{c_emoji} {claude_confidence}**  `{c_bar}`\n\n{claude_analysis}",
-            "color": c_color,
             "author": {"name": "\U0001f916 Claude Analysis"},
+            "description": (
+                f"{c_emoji} **{c_label}**\n"
+                f"\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\u2015\n"
+                f"{claude_analysis}"
+            ),
+            "color": c_color,
         }
         if is_test:
             claude_embed["footer"] = {"text": "\U0001f9ea TEST ALERT \u2014 not stored in database"}
