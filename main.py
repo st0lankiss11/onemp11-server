@@ -146,6 +146,17 @@ ALERT TYPES:
 - NO_ENTRY: 2pm block started
 - SESSION_OPEN: 8pm session open
 
+TRAFFIC LIGHT SYSTEM (data-driven hold/bank signal):
+- 3 checks computed on every bar, shown on milestone alerts + table
+- Check 1 (RSI zone): 🟢 55-65 (9% giveback) │ 🟡 45-55 or 65-70 │ 🔴 <45 or >70 (40% giveback)
+- Check 2 (Slope magnitude): 🟢 medium slope (goldilocks) │ 🟡 weak │ 🔴 too steep (exhausted)
+- Check 3 (Momentum fade): 🟢 not fading │ 🔴 declining 2+ bars (30% giveback)
+- 🟢🟢🟢 HOLD = all three green, safest hold zone
+- 🟢🟢🔴 LEAN HOLD = mostly safe, one concern
+- 🟡🔴🟢 CAUTION = multiple warnings, tighten mentally
+- 🔴🔴🔴 BANK IT = all three red, high probability of giveback
+- This is DISPLAY ONLY — does not change entries or exits. Trader uses it for discretionary sizing.
+
 CONFIDENCE RULES:
 - HIGH: Entry/reversal with ADX>25, strong momentum, TL TIGHT/RIDING, RSI 40-60
 - MEDIUM: Mostly aligned but one concern (extended TL, fading mom, session risk)
@@ -446,7 +457,7 @@ def parse_alert(raw_json):
         "alert_type": "", "direction": "", "price": 0, "exit_pts": 0,
         "daily_pnl": 0, "weekly_pnl": 0, "monthly_pnl": 0, "total_pnl": 0,
         "tl_spread": 0, "tl_state": "", "rsi": 0, "vix_rsi": 0,
-        "compare_rsi": 0, "adx": -1, "verdict": "",
+        "compare_rsi": 0, "adx": -1, "verdict": "", "traffic": "",
         "raw_json": json.dumps(raw_json) if isinstance(raw_json, dict) else str(raw_json),
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -564,6 +575,11 @@ def parse_alert(raw_json):
                 data["verdict"] = vm.group(1).strip()
                 break
 
+        # Traffic light — "🟢🟢🟢 HOLD" or "🟡🔴🟢 CAUTION" etc.
+        traffic_match = re.search(r'([🟢🟡🔴]{3,})\s*(HOLD|LEAN HOLD|CAUTION|BANK IT)', content)
+        if traffic_match:
+            data["traffic"] = f"{traffic_match.group(1)} {traffic_match.group(2)}"
+
     except Exception as e:
         data["alert_type"] = "PARSE_ERROR"
         data["verdict"] = str(e)
@@ -613,6 +629,7 @@ CURRENT ALERT:
   CL RSI: {alert_data.get('compare_rsi', 0)}
   TL: {alert_data.get('tl_spread', 0)} ({alert_data.get('tl_state', '')})
   Verdict: {alert_data.get('verdict', 'none')}
+  Traffic Light: {alert_data.get('traffic', 'none')}
   Session: {get_session_from_time(alert_data.get('timestamp', ''))}
 
 Brief assessment (2-3 sentences). Reference database patterns with specific numbers.
@@ -713,6 +730,11 @@ def build_discord_payload(alert_data, claude_analysis="", claude_confidence="", 
     verdict = alert_data.get("verdict", "")
     if verdict:
         lines.append(f"│  {verdict}")
+
+    # Traffic light (hold/bank signal)
+    traffic = alert_data.get("traffic", "")
+    if traffic:
+        lines.append(f"│  {traffic}")
 
     # Exit P&L (for exits/reversals)
     exit_pts = alert_data.get("exit_pts", 0)
