@@ -10,6 +10,8 @@ import re
 import sqlite3
 import time
 import traceback
+import threading
+import feedparser
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 import requests
@@ -24,6 +26,83 @@ ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 WEBHOOK_SECRET      = os.environ.get("WEBHOOK_SECRET", "onemp11")
 ENABLE_CLAUDE       = os.environ.get("ENABLE_CLAUDE", "true").lower() == "true"
 DB_PATH             = os.environ.get("DB_PATH", "alerts.db")
+
+
+# ===================================================
+# FINANCIALJUICE NEWS FEED CONFIG
+# ===================================================
+FJ_RSS_URL = "https://www.financialjuice.com/feed.ashx?xy=rss"
+FJ_POLL_INTERVAL = 30  # seconds between polls
+FJ_MAX_HEADLINES = 20  # max headlines to cache
+ENABLE_NEWS = os.environ.get("ENABLE_NEWS", "true").lower() == "true"
+
+# In-memory news cache (thread-safe)
+news_cache = []
+news_cache_lock = threading.Lock()
+news_last_poll = 0
+
+# ===================================================
+# NEWS FEED FUNCTIONS
+# ===================================================
+def fetch_news():
+    """Fetch latest headlines from FinancialJuice RSS feed"""
+    global news_cache, news_last_poll
+    try:
+        feed = feedparser.parse(FJ_RSS_URL)
+        headlines = []
+        for entry in feed.entries[:FJ_MAX_HEADLINES]:
+            published = ""
+            if hasattr(entry, "published_parsed") and entry.published_parsed:
+                published = datetime(*entry.published_parsed[:6]).isoformat()
+            headlines.append({
+                "title": entry.get("title", "").strip(),
+                "published": published,
+                "link": entry.get("link", ""),
+            })
+        with news_cache_lock:
+            news_cache = headlines
+            news_last_poll = time.time()
+        print(f"NEWS: Fetched {len(headlines)} headlines from FinancialJuice")
+    except Exception as e:
+        print(f"NEWS: Error fetching feed: {e}")
+
+def news_poll_loop():
+    """Background thread: poll FinancialJuice RSS every FJ_POLL_INTERVAL seconds"""
+    while True:
+        try:
+            fetch_news()
+        except Exception as e:
+            print(f"NEWS: Poll loop error: {e}")
+        time.sleep(FJ_POLL_INTERVAL)
+
+def start_news_thread():
+    """Start the background news polling thread (daemon so it dies with the app)"""
+    if not ENABLE_NEWS:
+        print("NEWS: Disabled via ENABLE_NEWS=false")
+        return
+    t = threading.Thread(target=news_poll_loop, daemon=True, name="news-poller")
+    t.start()
+    print(f"NEWS: Background poller started (interval={FJ_POLL_INTERVAL}s)")
+
+def get_news_context(max_items=5):
+    """Build a news context string for Claude from cached headlines"""
+    with news_cache_lock:
+        items = list(news_cache)
+    if not items:
+        return ""
+    recent = items[:max_items]
+    lines = ["\nRECENT MARKET NEWS (FinancialJuice):"]
+    for item in recent:
+        ts = ""
+        if item["published"]:
+            try:
+                dt = datetime.fromisoformat(item["published"])
+                ts = dt.strftime("%H:%M CT")
+            except Exception:
+                ts = item["published"][:16]
+        lines.append(f"  [{ts}] {item['title']}")
+    lines.append("  (Use news for context only — do not override signal logic based on headlines)")
+    return "\n".join(lines)
 
 # ===================================================
 # ONEMP11 V8.1b KNOWLEDGE BASE (updated)
@@ -690,12 +769,15 @@ def parse_alert(raw_json):
 # CLAUDE ANALYSIS
 # ===================================================
 def analyze_with_claude(alert_data, recent_alerts):
-    """Send alert + database history context to Claude for analysis"""
+    """Send alert + database history context + news to Claude for analysis"""
     if not ANTHROPIC_API_KEY or not ENABLE_CLAUDE:
         return "", ""
 
     pattern_context = get_pattern_analysis()
     similar = get_similar_trades(alert_data)
+
+    # Get live news context from FinancialJuice
+    news_context = get_news_context(max_items=5)
 
     recent_context = ""
     if recent_alerts:
@@ -720,6 +802,7 @@ DATABASE CONTEXT (your trade history):
 {pattern_context}
 {similar_context}
 {recent_context}
+{news_context}
 
 CURRENT ALERT TO ANALYZE:
   Type: {alert_data.get('alert_type', '')}
@@ -735,7 +818,9 @@ CURRENT ALERT TO ANALYZE:
 
 Provide a brief technical assessment (2-3 sentences max). Be specific — reference
 database patterns (e.g. "Your LONG entries from RIDING state have won 68% of the time").
-Mention the session context if relevant.
+Mention the session context if relevant. If recent news headlines are provided and
+clearly relevant (e.g. FOMC, CPI, NFP, tariffs, major geopolitical events), briefly
+note the potential impact — but do NOT override signal logic based on news alone.
 End with exactly one of: [HIGH CONFIDENCE], [MEDIUM CONFIDENCE], or [LOW CONFIDENCE]."""
 
     try:
@@ -1083,6 +1168,19 @@ def knowledge():
     })
 
 
+@app.route("/news", methods=["GET"])
+def news():
+    """View cached news headlines from FinancialJuice"""
+    with news_cache_lock:
+        items = list(news_cache)
+    return jsonify({
+        "enabled": ENABLE_NEWS,
+        "headlines": items,
+        "last_poll": news_last_poll,
+        "poll_interval": FJ_POLL_INTERVAL,
+        "count": len(items)
+    })
+
 @app.route("/weekly-summary", methods=["GET"])
 def weekly_summary():
     """Generate weekly performance summary using Claude"""
@@ -1142,6 +1240,9 @@ Be concise and actionable. Use specific numbers from the data."""
 
     return jsonify({"stats": stats_data, "sessions": session_data, "summary": "Claude unavailable"})
 
+
+# Start the background news poller
+start_news_thread()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
