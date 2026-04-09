@@ -505,6 +505,18 @@ RSI Cross-Market Context:
 - VIX RSI < 30 = complacency (bullish support)
 - CL RSI diverging from ES RSI = cross-market stress
 
+ADR TARGET LEVELS (PivotBoss ADR method):
+- ADR = 10-day Average Daily Range. Levels calculated from today's low (bull) or high (bear).
+- R75% / S75% = Primary target (75% of average daily move used). Good first bank zone.
+- R100% / S100% = Full ADR exhausted. Only ~5% of days exceed this. STRONG bank signal.
+- R125% / S125% = Extended day. Rare — lock in profits unless extreme trend day (ADX 40+, GGG traffic).
+- When ADR_R100 or ADR_S100 fires:
+  → If traffic is RRR/RGR/YRR → "BANK IT — full ADR + momentum dying"
+  → If traffic is GGG + ADX 35+ → "HOLD — trend day, could push to 125%"
+  → If traffic is mixed → "BANK HALF — protect gains but leave runner"
+- ADR% in [D] data line shows how much of daily range is consumed (e.g. ADR:95 = 95% used)
+- TGT in [D] data line shows the next ADR target price level
+
 NEWS IMPACT RULES:
 - HIGH IMPACT events (Fed decisions, CPI, NFP, tariffs, geopolitical escalation):
   → If headline clearly affects ES direction AND you have an active trade → flag risk level
@@ -1091,6 +1103,12 @@ def parse_alert(raw_json):
             data["alert_type"] = "TREND_OVER"
         elif "MARKET CHECK" in content:
             data["alert_type"] = "MARKET_CHECK"
+        elif "ADR 125%" in content:
+            data["alert_type"] = "ADR_R125" if "LONG" in content else "ADR_S125"
+        elif "ADR 100%" in content:
+            data["alert_type"] = "ADR_R100" if "LONG" in content else "ADR_S100"
+        elif "ADR 75%" in content:
+            data["alert_type"] = "ADR_R75" if "LONG" in content else "ADR_S75"
         elif "REGIME SHIFT" in content:
             data["alert_type"] = "REGIME_SHIFT"
         elif "NO-ENTRY ZONE" in content:
@@ -1363,7 +1381,7 @@ CONFLUENCE SCORING (only for V8.1b entry/reversal alerts):
     try:
         # Fetch chart image for V8.1b actionable alerts
         chart_image = None
-        vision_types = ["ENTRY", "RE_ENTRY", "REVERSAL", "MILESTONE_UP", "MILESTONE_DOWN"]
+        vision_types = ["ENTRY", "RE_ENTRY", "REVERSAL", "MILESTONE_UP", "MILESTONE_DOWN", "ADR_R100", "ADR_R125", "ADR_S100", "ADR_S125"]
         if alert_data.get("alert_type", "") in vision_types:
             chart_image = fetch_chart_image()
 
@@ -1467,6 +1485,13 @@ ALERT_STYLES = {
     "SPY_VIX_TP":     {"emoji": "🎯", "color": 5763719,  "label": "SPY/VIX TP HIT"},
     # News
     "NEWS_IMPACT":    {"emoji": "📰", "color": 16750848, "label": "NEWS ALERT"},
+    # ADR target alerts
+    "ADR_R75":        {"emoji": "📍", "color": 3447003,  "label": "ADR 75% TARGET"},
+    "ADR_R100":       {"emoji": "🎯", "color": 16750848, "label": "ADR 100% — FULL RANGE"},
+    "ADR_R125":       {"emoji": "🏆", "color": 15844367, "label": "ADR 125% — EXTENDED"},
+    "ADR_S75":        {"emoji": "📍", "color": 3447003,  "label": "ADR 75% TARGET"},
+    "ADR_S100":       {"emoji": "🎯", "color": 16750848, "label": "ADR 100% — FULL RANGE"},
+    "ADR_S125":       {"emoji": "🏆", "color": 15844367, "label": "ADR 125% — EXTENDED"},
     # Fallback
     "PARSE_ERROR":    {"emoji": "❓", "color": 9807270,  "label": "UNKNOWN"},
 }
