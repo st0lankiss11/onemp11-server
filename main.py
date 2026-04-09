@@ -1568,6 +1568,46 @@ def health():
     })
 
 
+def process_alert_background(raw, source):
+    """Background thread: Claude analysis + DB store + Discord forward"""
+    try:
+        if source == "SPY_VIX":
+            alert_data = parse_spyvix_alert(raw)
+        elif source == "RSI_PROFILE":
+            alert_data = parse_rsi_profile_alert(raw)
+        else:
+            alert_data = parse_alert(raw)
+
+        recent = get_recent_alerts(10)
+
+        claude_analysis, claude_confidence = "", ""
+        skip_types = ["TREND_OVER"]
+        if alert_data["alert_type"] not in skip_types:
+            claude_analysis, claude_confidence = analyze_with_claude(alert_data, recent)
+
+        alert_data["claude_analysis"] = claude_analysis
+        alert_data["claude_confidence"] = claude_confidence
+
+        store_alert(alert_data)
+        forward_to_discord(alert_data, claude_analysis, claude_confidence)
+        print(f"BG: Processed {source}/{alert_data['alert_type']} → {claude_confidence or 'no analysis'}")
+    except Exception as e:
+        print(f"BG ERROR: {e}")
+        traceback.print_exc()
+        # Still try to forward raw alert to Discord even if Claude fails
+        try:
+            if source == "SPY_VIX":
+                alert_data = parse_spyvix_alert(raw)
+            elif source == "RSI_PROFILE":
+                alert_data = parse_rsi_profile_alert(raw)
+            else:
+                alert_data = parse_alert(raw)
+            store_alert(alert_data)
+            forward_to_discord(alert_data)
+        except Exception:
+            pass
+
+
 @app.route("/webhook", methods=["POST"])
 def webhook():
     try:
@@ -1578,29 +1618,14 @@ def webhook():
         except Exception:
             return jsonify({"error": "Invalid JSON"}), 400
 
-    # Detect source and route to correct parser
+    # Detect source immediately (fast — no API calls)
     source = detect_source(raw)
-    if source == "SPY_VIX":
-        alert_data = parse_spyvix_alert(raw)
-    elif source == "RSI_PROFILE":
-        alert_data = parse_rsi_profile_alert(raw)
-    else:
-        alert_data = parse_alert(raw)
 
-    recent = get_recent_alerts(10)
+    # Return 200 OK to TradingView IMMEDIATELY — process in background
+    t = threading.Thread(target=process_alert_background, args=(raw, source), daemon=True)
+    t.start()
 
-    claude_analysis, claude_confidence = "", ""
-    skip_types = ["TREND_OVER"]
-    if alert_data["alert_type"] not in skip_types:
-        claude_analysis, claude_confidence = analyze_with_claude(alert_data, recent)
-
-    alert_data["claude_analysis"] = claude_analysis
-    alert_data["claude_confidence"] = claude_confidence
-
-    store_alert(alert_data)
-    forward_to_discord(alert_data, claude_analysis, claude_confidence)
-
-    return jsonify({"status": "ok", "source": source, "type": alert_data["alert_type"], "confidence": claude_confidence})
+    return jsonify({"status": "accepted", "source": source}), 200
 
 
 @app.route("/test-webhook", methods=["POST"])
