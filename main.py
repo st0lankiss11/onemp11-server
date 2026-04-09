@@ -540,7 +540,8 @@ def init_db():
             cvd_mom REAL DEFAULT 0, histogram REAL DEFAULT 0,
             kalman_slope REAL DEFAULT 0, candle_color TEXT DEFAULT '',
             traffic TEXT DEFAULT '', regime TEXT DEFAULT '',
-            spread_ratio REAL DEFAULT 0, open_pnl REAL DEFAULT 0
+            spread_ratio REAL DEFAULT 0, open_pnl REAL DEFAULT 0,
+            source TEXT DEFAULT 'V8_1B'
         )
     """)
     # Migration for existing DBs — add new columns if missing
@@ -550,6 +551,7 @@ def init_db():
         ("candle_color", "TEXT DEFAULT ''"), ("traffic", "TEXT DEFAULT ''"),
         ("regime", "TEXT DEFAULT ''"), ("spread_ratio", "REAL DEFAULT 0"),
         ("open_pnl", "REAL DEFAULT 0"),
+        ("source", "TEXT DEFAULT 'V8_1B'"),
     ]
     for col, ctype in new_cols:
         try:
@@ -592,8 +594,8 @@ def store_alert(data):
             tl_spread, tl_state, rsi, vix_rsi, compare_rsi,
             adx, verdict, claude_analysis, claude_confidence, raw_json, session,
             cvd_mom, histogram, kalman_slope, candle_color, traffic, regime,
-            spread_ratio, open_pnl
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            spread_ratio, open_pnl, source
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         data.get("timestamp", ""), data.get("alert_type", ""),
         data.get("direction", ""), data.get("price", 0),
@@ -827,6 +829,196 @@ def clear_all_alerts():
 
 
 # ===================================================
+# MULTI-SOURCE DETECTION
+# ===================================================
+def detect_source(raw_json):
+    """Detect which script sent the alert"""
+    if isinstance(raw_json, dict):
+        # SPY/VIX script sends embeds with title pattern "🟢 ES1! — BULLISH"
+        embeds = raw_json.get("embeds", [])
+        if embeds and isinstance(embeds, list) and len(embeds) > 0:
+            title = embeds[0].get("title", "")
+            if "BULLISH" in title or "BEARISH" in title or "TP HIT" in title:
+                return "SPY_VIX"
+        content = raw_json.get("content", "")
+        if "[RSI-PROFILE]" in content:
+            return "RSI_PROFILE"
+    return "V8_1B"
+
+
+def parse_spyvix_alert(raw_json):
+    """Parse SPY/VIX Discord TradeBot alert (embeds format)"""
+    data = {
+        "alert_type": "", "direction": "", "price": 0, "exit_pts": 0,
+        "rsi": 0, "vix_rsi": 0, "adx": -1, "verdict": "", "traffic": "",
+        "source": "SPY_VIX", "raw_json": json.dumps(raw_json),
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    try:
+        embeds = raw_json.get("embeds", [{}])
+        embed = embeds[0] if embeds else {}
+        title = embed.get("title", "")
+
+        # TP Hit alert
+        if "TP HIT" in title:
+            data["alert_type"] = "SPY_VIX_TP"
+            data["direction"] = "LONG" if "LONG" in title else "SHORT"
+            for field in embed.get("fields", []):
+                val = field.get("value", "")
+                if "pts" in val:
+                    m = re.search(r'([+-]?\d+\.?\d*).*pts', val)
+                    if m:
+                        data["exit_pts"] = float(m.group(1))
+            return data
+
+        # Entry signal
+        if "BULLISH" in title:
+            data["alert_type"] = "SPY_VIX_ENTRY"
+            data["direction"] = "LONG"
+        elif "BEARISH" in title:
+            data["alert_type"] = "SPY_VIX_ENTRY"
+            data["direction"] = "SHORT"
+
+        # Extract confidence from title "🟢 ES1! — BULLISH (72%)"
+        conf_match = re.search(r'\((\d+)%\)', title)
+        if conf_match:
+            data["verdict"] = f"SPY/VIX Confidence: {conf_match.group(1)}%"
+
+        # Parse fields
+        for field in embed.get("fields", []):
+            name = field.get("name", "")
+            val = field.get("value", "")
+
+            if "Technical" in name:
+                rsi_m = re.search(r'SPY\s*(\d+)', val)
+                if rsi_m:
+                    data["rsi"] = float(rsi_m.group(1))
+                vix_m = re.search(r'VIX\s*(\d+)', val)
+                if vix_m:
+                    data["vix_rsi"] = float(vix_m.group(1))
+
+            elif "Levels" in name:
+                entry_m = re.search(r'Entry.*?\$(\d[\d,.]+)', val)
+                if entry_m:
+                    data["price"] = float(entry_m.group(1).replace(",", ""))
+
+            elif "HTF" in name:
+                htf_m = re.search(r'Alignment.*?(\d+)%', val)
+                if htf_m:
+                    data["traffic"] = f"HTF:{htf_m.group(1)}%"
+
+    except Exception as e:
+        data["alert_type"] = "SPY_VIX_PARSE_ERROR"
+        data["verdict"] = str(e)
+    return data
+
+
+def parse_rsi_profile_alert(raw_json):
+    """Parse RSI Profile Overlay alert"""
+    data = {
+        "alert_type": "", "direction": "", "price": 0,
+        "rsi": 0, "adx": -1, "verdict": "", "source": "RSI_PROFILE",
+        "raw_json": json.dumps(raw_json) if isinstance(raw_json, dict) else str(raw_json),
+        "timestamp": datetime.utcnow().isoformat()
+    }
+    try:
+        content = raw_json.get("content", "") if isinstance(raw_json, dict) else ""
+
+        if "TIER2 LONG" in content or "ZONE LONG" in content:
+            data["alert_type"] = "RSI_PROFILE_LONG"
+            data["direction"] = "LONG"
+        elif "TIER2 SHORT" in content or "ZONE SHORT" in content:
+            data["alert_type"] = "RSI_PROFILE_SHORT"
+            data["direction"] = "SHORT"
+        elif "TIER1 LONG" in content:
+            data["alert_type"] = "RSI_PROFILE_PENDING_LONG"
+            data["direction"] = "LONG"
+        elif "TIER1 SHORT" in content:
+            data["alert_type"] = "RSI_PROFILE_PENDING_SHORT"
+            data["direction"] = "SHORT"
+
+        # Parse data fields: RSI:58 POC:52 ADX:27 VWAP:6816.50
+        for pattern, key in [(r'RSI:(\d+)', 'rsi'), (r'ADX:(\d+)', 'adx'),
+                              (r'VWAP:\$?([\d,.]+)', 'price')]:
+            m = re.search(pattern, content)
+            if m:
+                data[key] = float(m.group(1).replace(",", ""))
+
+        # Zone range
+        zone_m = re.search(r'Zone:\s*\$([\d,.]+)-\$([\d,.]+)', content)
+        if zone_m:
+            data["verdict"] = f"Zone: ${zone_m.group(1)}-${zone_m.group(2)}"
+
+    except Exception as e:
+        data["alert_type"] = "RSI_PROFILE_PARSE_ERROR"
+        data["verdict"] = str(e)
+    return data
+
+
+def get_confluence_context(alert_data, minutes=15):
+    """Query DB for recent signals from OTHER sources for confluence analysis"""
+    source = alert_data.get("source", "V8_1B")
+    direction = alert_data.get("direction", "")
+    cutoff = (datetime.utcnow() - timedelta(minutes=minutes)).isoformat()
+
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""
+            SELECT source, alert_type, direction, price, rsi, verdict, timestamp
+            FROM alerts
+            WHERE source != ? AND timestamp > ?
+            ORDER BY id DESC LIMIT 20
+        """, (source, cutoff))
+        rows = c.fetchall()
+        conn.close()
+
+        if not rows:
+            return "\nCROSS-INDICATOR CONFLUENCE: No recent signals from other indicators."
+
+        lines = ["\nCROSS-INDICATOR CONFLUENCE (last 15 min):"]
+        agrees = 0
+        disagrees = 0
+
+        for row in rows:
+            src, atype, dir, price, rsi, verdict, ts = row
+            src_label = {"SPY_VIX": "SPY/VIX TradeBot", "RSI_PROFILE": "RSI Profile", "V8_1B": "V8.1b"}.get(src, src)
+
+            # Check agreement
+            if direction and dir:
+                if dir == direction:
+                    agrees += 1
+                    emoji = "✅"
+                else:
+                    disagrees += 1
+                    emoji = "❌"
+            else:
+                emoji = "ℹ️"
+
+            time_str = ts[-8:-3] if len(ts) > 8 else ts
+            lines.append(f"  {emoji} {src_label}: {atype} {dir} (RSI:{rsi:.0f}) @ {time_str}")
+            if verdict:
+                lines.append(f"     {verdict}")
+
+        # Summary
+        total = agrees + disagrees
+        if total > 0:
+            if agrees > 0 and disagrees == 0:
+                lines.append(f"\n  🟢 ALL {agrees} indicator(s) AGREE with {direction} — STRONG confluence")
+            elif agrees > disagrees:
+                lines.append(f"\n  🟡 {agrees}/{total} agree, {disagrees} disagree — MODERATE confluence")
+            elif disagrees > agrees:
+                lines.append(f"\n  🔴 {disagrees}/{total} DISAGREE — WEAK confluence, consider skipping")
+            else:
+                lines.append(f"\n  🟡 Mixed signals — proceed with caution")
+
+        return "\n".join(lines)
+
+    except Exception as e:
+        return f"\nCONFLUENCE: Error querying — {e}"
+
+
+# ===================================================
 # ALERT PARSER (synced with V8.1b — fixed price/ADX)
 # ===================================================
 def parse_alert(raw_json):
@@ -836,7 +1028,7 @@ def parse_alert(raw_json):
         "tl_spread": 0, "tl_state": "", "rsi": 0, "vix_rsi": 0,
         "compare_rsi": 0, "adx": -1, "verdict": "", "traffic": "",
         "cvd_mom": 0, "histogram": 0, "kalman_slope": 0, "candle_color": "",
-        "regime": "", "spread_ratio": 0, "open_pnl": 0,
+        "regime": "", "spread_ratio": 0, "open_pnl": 0, "source": "V8_1B",
         "raw_json": json.dumps(raw_json) if isinstance(raw_json, dict) else str(raw_json),
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -1006,29 +1198,33 @@ def analyze_with_claude(alert_data, recent_alerts):
     pattern_context = get_pattern_analysis()
     similar = get_similar_trades(alert_data)
     news_context = get_news_context(max_items=5)
+    confluence_context = get_confluence_context(alert_data, minutes=15)
 
     recent_context = ""
     if recent_alerts:
         recent_context = "\nRecent alerts:\n"
         for a in recent_alerts[:10]:
             pts_tag = f" exit:{a.get('exit_pts', 0):+.1f}pts" if a.get('exit_pts', 0) != 0 else ""
-            recent_context += f"  {a.get('alert_type', '')} {a.get('direction', '')}{pts_tag} ({a.get('session', '')})\n"
+            src_tag = f" [{a.get('source', 'V8_1B')}]" if a.get('source', 'V8_1B') != 'V8_1B' else ""
+            recent_context += f"  {a.get('alert_type', '')} {a.get('direction', '')}{pts_tag}{src_tag} ({a.get('session', '')})\n"
 
     similar_context = ""
     if similar["direction_trades"] > 0:
         similar_context = f"\nSIMILAR PATTERNS:\n  {similar['direction_trades']} {alert_data.get('direction', '')} trades: {similar['direction_wr']}% WR\n  {similar['tl_trades']} {similar['tl_state']} entries: {similar['tl_wr']}% WR\n  {similar['session_trades']} {similar['session']} trades: {similar['session_wr']}% WR"
 
     adx_val = alert_data.get('adx', -1)
-    adx_str = "N/A (not in this alert type — do NOT assume zero)" if adx_val == -1 else str(adx_val)
+    adx_str = "N/A (not in this alert type)" if adx_val == -1 else str(adx_val)
+    source = alert_data.get('source', 'V8_1B')
 
     prompt = f"""{SYSTEM_KNOWLEDGE}
 
 {pattern_context}
 {similar_context}
 {recent_context}
+{confluence_context}
 {news_context}
 
-CURRENT ALERT:
+CURRENT ALERT (source: {source}):
   Type: {alert_data.get('alert_type', '')}
   Direction: {alert_data.get('direction', '')}
   Price: {alert_data.get('price', 0)}
@@ -1047,9 +1243,18 @@ CURRENT ALERT:
   Open P&L: {alert_data.get('open_pnl', 0):+.1f}pts
   Session: {get_session_from_time(alert_data.get('timestamp', ''))}
 
-Brief assessment (2-3 sentences). Reference database patterns with specific numbers.
-If news is relevant, note it briefly. End with exactly one of:
-[HIGH CONFIDENCE], [MEDIUM CONFIDENCE], or [LOW CONFIDENCE]."""
+INSTRUCTIONS — Be actionable. The trader needs to make money, not read essays.
+1. Start with your VERDICT: "TAKE IT" / "SKIP" / "HOLD" / "BANK PROFIT" / "CUT LOSS"
+2. One sentence explaining WHY (reference confluence + database stats)
+3. If multiple indicators agree, highlight it: "Triple confluence — all 3 systems say LONG"
+4. If they disagree, say which ones and why it matters
+5. End with: [HIGH CONFIDENCE], [MEDIUM CONFIDENCE], or [LOW CONFIDENCE]
+
+CONFLUENCE SCORING:
+- 3/3 indicators agree = HIGH confidence (mention "triple confluence")
+- 2/3 agree = MEDIUM confidence (note the disagreeing one)
+- 1/3 or 0/3 = LOW confidence (recommend skipping)
+- No other signals recently = judge on this signal alone using database history"""
 
     try:
         response = requests.post(
@@ -1310,11 +1515,19 @@ def webhook():
         except Exception:
             return jsonify({"error": "Invalid JSON"}), 400
 
-    alert_data = parse_alert(raw)
+    # Detect source and route to correct parser
+    source = detect_source(raw)
+    if source == "SPY_VIX":
+        alert_data = parse_spyvix_alert(raw)
+    elif source == "RSI_PROFILE":
+        alert_data = parse_rsi_profile_alert(raw)
+    else:
+        alert_data = parse_alert(raw)
+
     recent = get_recent_alerts(10)
 
     claude_analysis, claude_confidence = "", ""
-    skip_types = ["TREND_OVER"]  # Claude analyzes everything else for data collection
+    skip_types = ["TREND_OVER"]
     if alert_data["alert_type"] not in skip_types:
         claude_analysis, claude_confidence = analyze_with_claude(alert_data, recent)
 
@@ -1324,7 +1537,7 @@ def webhook():
     store_alert(alert_data)
     forward_to_discord(alert_data, claude_analysis, claude_confidence)
 
-    return jsonify({"status": "ok", "type": alert_data["alert_type"], "confidence": claude_confidence})
+    return jsonify({"status": "ok", "source": source, "type": alert_data["alert_type"], "confidence": claude_confidence})
 
 
 @app.route("/test-webhook", methods=["POST"])
@@ -1337,11 +1550,11 @@ def test_webhook():
         except Exception:
             return jsonify({"error": "Invalid JSON"}), 400
 
-    alert_data = parse_alert(raw)
+    alert_data = parse_alert(raw) if detect_source(raw) == "V8_1B" else (parse_spyvix_alert(raw) if detect_source(raw) == "SPY_VIX" else parse_rsi_profile_alert(raw))
     recent = get_recent_alerts(10)
 
     claude_analysis, claude_confidence = "", ""
-    skip_types = ["TREND_OVER"]  # Claude analyzes everything else for data collection
+    skip_types = ["TREND_OVER"]
     if alert_data["alert_type"] not in skip_types:
         claude_analysis, claude_confidence = analyze_with_claude(alert_data, recent)
 
