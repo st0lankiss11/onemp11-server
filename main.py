@@ -610,11 +610,11 @@ def store_alert(data):
         data.get("cvd_mom", 0), data.get("histogram", 0),
         data.get("kalman_slope", 0), data.get("candle_color", ""),
         data.get("traffic", ""), data.get("regime", ""),
-        data.get("spread_ratio", 0), data.get("open_pnl", 0)
+        data.get("spread_ratio", 0), data.get("open_pnl", 0),
+        data.get("source", "V8_1B")
     ))
     conn.commit()
     conn.close()
-
 
 def get_recent_alerts(n=10):
     conn = sqlite3.connect(DB_PATH)
