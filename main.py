@@ -26,7 +26,10 @@ DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 WEBHOOK_SECRET      = os.environ.get("WEBHOOK_SECRET", "onemp11")
 ENABLE_CLAUDE       = os.environ.get("ENABLE_CLAUDE", "true").lower() == "true"
-DB_PATH             = os.environ.get("DB_PATH", "alerts.db")
+DB_PATH             = os.environ.get("DB_PATH", "/data/alerts.db")
+
+# Ensure DB directory exists (Railway volumes mount at /data)
+os.makedirs(os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else ".", exist_ok=True)
 
 # ===================================================
 # FINANCIALJUICE NEWS FEED
@@ -35,6 +38,7 @@ FJ_RSS_URL = "https://www.financialjuice.com/feed.ashx?xy=rss"
 FJ_POLL_INTERVAL = 30
 FJ_MAX_HEADLINES = 20
 ENABLE_NEWS = os.environ.get("ENABLE_NEWS", "true").lower() == "true"
+CHART_URL   = os.environ.get("CHART_URL", "https://www.tradingview.com/chart/jDqlGthU/")
 
 news_cache = []
 news_cache_lock = threading.Lock()
@@ -527,39 +531,52 @@ CONFIDENCE RULES:
 # DATABASE
 # ===================================================
 def init_db():
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        CREATE TABLE IF NOT EXISTS alerts (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            timestamp TEXT, alert_type TEXT, direction TEXT, price REAL,
-            exit_pts REAL, daily_pnl REAL, weekly_pnl REAL, monthly_pnl REAL,
-            total_pnl REAL, tl_spread REAL, tl_state TEXT, rsi REAL,
-            vix_rsi REAL, compare_rsi REAL, adx REAL, verdict TEXT,
-            claude_analysis TEXT, claude_confidence TEXT, raw_json TEXT, session TEXT,
-            cvd_mom REAL DEFAULT 0, histogram REAL DEFAULT 0,
-            kalman_slope REAL DEFAULT 0, candle_color TEXT DEFAULT '',
-            traffic TEXT DEFAULT '', regime TEXT DEFAULT '',
-            spread_ratio REAL DEFAULT 0, open_pnl REAL DEFAULT 0,
-            source TEXT DEFAULT 'V8_1B'
-        )
-    """)
-    # Migration for existing DBs — add new columns if missing
-    new_cols = [
-        ("session", "TEXT DEFAULT ''"), ("cvd_mom", "REAL DEFAULT 0"),
-        ("histogram", "REAL DEFAULT 0"), ("kalman_slope", "REAL DEFAULT 0"),
-        ("candle_color", "TEXT DEFAULT ''"), ("traffic", "TEXT DEFAULT ''"),
-        ("regime", "TEXT DEFAULT ''"), ("spread_ratio", "REAL DEFAULT 0"),
-        ("open_pnl", "REAL DEFAULT 0"),
-        ("source", "TEXT DEFAULT 'V8_1B'"),
-    ]
-    for col, ctype in new_cols:
-        try:
-            c.execute(f"ALTER TABLE alerts ADD COLUMN {col} {ctype}")
-        except sqlite3.OperationalError:
-            pass
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""
+            CREATE TABLE IF NOT EXISTS alerts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TEXT, alert_type TEXT, direction TEXT, price REAL,
+                exit_pts REAL, daily_pnl REAL, weekly_pnl REAL, monthly_pnl REAL,
+                total_pnl REAL, tl_spread REAL, tl_state TEXT, rsi REAL,
+                vix_rsi REAL, compare_rsi REAL, adx REAL, verdict TEXT,
+                claude_analysis TEXT, claude_confidence TEXT, raw_json TEXT, session TEXT,
+                cvd_mom REAL DEFAULT 0, histogram REAL DEFAULT 0,
+                kalman_slope REAL DEFAULT 0, candle_color TEXT DEFAULT '',
+                traffic TEXT DEFAULT '', regime TEXT DEFAULT '',
+                spread_ratio REAL DEFAULT 0, open_pnl REAL DEFAULT 0,
+                source TEXT DEFAULT 'V8_1B'
+            )
+        """)
+        # Migration for existing DBs — add new columns if missing
+        new_cols = [
+            ("session", "TEXT DEFAULT ''"), ("cvd_mom", "REAL DEFAULT 0"),
+            ("histogram", "REAL DEFAULT 0"), ("kalman_slope", "REAL DEFAULT 0"),
+            ("candle_color", "TEXT DEFAULT ''"), ("traffic", "TEXT DEFAULT ''"),
+            ("regime", "TEXT DEFAULT ''"), ("spread_ratio", "REAL DEFAULT 0"),
+            ("open_pnl", "REAL DEFAULT 0"),
+            ("source", "TEXT DEFAULT 'V8_1B'"),
+        ]
+        for col, ctype in new_cols:
+            try:
+                c.execute(f"ALTER TABLE alerts ADD COLUMN {col} {ctype}")
+            except sqlite3.OperationalError:
+                pass
+        conn.commit()
+        conn.close()
+        print(f"DB: Initialized at {DB_PATH}")
+
+        # Verify write works
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM alerts")
+        count = c.fetchone()[0]
+        conn.close()
+        print(f"DB: {count} existing alerts")
+    except Exception as e:
+        print(f"DB INIT ERROR: {e}")
+        traceback.print_exc()
 
 
 init_db()
@@ -585,36 +602,41 @@ def get_session_from_time(ts_str):
 
 def store_alert(data):
     session = get_session_from_time(data.get("timestamp", ""))
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("""
-        INSERT INTO alerts (
-            timestamp, alert_type, direction, price, exit_pts,
-            daily_pnl, weekly_pnl, monthly_pnl, total_pnl,
-            tl_spread, tl_state, rsi, vix_rsi, compare_rsi,
-            adx, verdict, claude_analysis, claude_confidence, raw_json, session,
-            cvd_mom, histogram, kalman_slope, candle_color, traffic, regime,
-            spread_ratio, open_pnl, source
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-    """, (
-        data.get("timestamp", ""), data.get("alert_type", ""),
-        data.get("direction", ""), data.get("price", 0),
-        data.get("exit_pts", 0), data.get("daily_pnl", 0),
-        data.get("weekly_pnl", 0), data.get("monthly_pnl", 0),
-        data.get("total_pnl", 0), data.get("tl_spread", 0),
-        data.get("tl_state", ""), data.get("rsi", 0),
-        data.get("vix_rsi", 0), data.get("compare_rsi", 0),
-        data.get("adx", -1), data.get("verdict", ""),
-        data.get("claude_analysis", ""), data.get("claude_confidence", ""),
-        data.get("raw_json", ""), session,
-        data.get("cvd_mom", 0), data.get("histogram", 0),
-        data.get("kalman_slope", 0), data.get("candle_color", ""),
-        data.get("traffic", ""), data.get("regime", ""),
-        data.get("spread_ratio", 0), data.get("open_pnl", 0),
-        data.get("source", "V8_1B")
-    ))
-    conn.commit()
-    conn.close()
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO alerts (
+                timestamp, alert_type, direction, price, exit_pts,
+                daily_pnl, weekly_pnl, monthly_pnl, total_pnl,
+                tl_spread, tl_state, rsi, vix_rsi, compare_rsi,
+                adx, verdict, claude_analysis, claude_confidence, raw_json, session,
+                cvd_mom, histogram, kalman_slope, candle_color, traffic, regime,
+                spread_ratio, open_pnl, source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """, (
+            data.get("timestamp", ""), data.get("alert_type", ""),
+            data.get("direction", ""), data.get("price", 0),
+            data.get("exit_pts", 0), data.get("daily_pnl", 0),
+            data.get("weekly_pnl", 0), data.get("monthly_pnl", 0),
+            data.get("total_pnl", 0), data.get("tl_spread", 0),
+            data.get("tl_state", ""), data.get("rsi", 0),
+            data.get("vix_rsi", 0), data.get("compare_rsi", 0),
+            data.get("adx", -1), data.get("verdict", ""),
+            data.get("claude_analysis", ""), data.get("claude_confidence", ""),
+            data.get("raw_json", ""), session,
+            data.get("cvd_mom", 0), data.get("histogram", 0),
+            data.get("kalman_slope", 0), data.get("candle_color", ""),
+            data.get("traffic", ""), data.get("regime", ""),
+            data.get("spread_ratio", 0), data.get("open_pnl", 0),
+            data.get("source", "V8_1B")
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"DB ERROR in store_alert: {e}")
+        traceback.print_exc()
+
 
 def get_recent_alerts(n=10):
     conn = sqlite3.connect(DB_PATH)
@@ -1225,6 +1247,7 @@ def analyze_with_claude(alert_data, recent_alerts):
 {news_context}
 
 CURRENT ALERT (source: {source}):
+  Chart: {CHART_URL}
   Type: {alert_data.get('alert_type', '')}
   Direction: {alert_data.get('direction', '')}
   Price: {alert_data.get('price', 0)}
@@ -1244,17 +1267,33 @@ CURRENT ALERT (source: {source}):
   Session: {get_session_from_time(alert_data.get('timestamp', ''))}
 
 INSTRUCTIONS — Be actionable. The trader needs to make money, not read essays.
-1. Start with your VERDICT: "TAKE IT" / "SKIP" / "HOLD" / "BANK PROFIT" / "CUT LOSS"
+
+ALERT SOURCE MATTERS:
+- V8.1b alerts (ENTRY, RE_ENTRY, REVERSAL, MILESTONE, SESSION_CLOSE) = PRIMARY trading system
+  → These are the actual trades. Give TAKE IT / SKIP / HOLD / BANK / CUT verdicts.
+- RSI_PROFILE alerts (TIER1, TIER2, ZONE) = SUPPORTING context
+  → These are NOT separate trades. They tell you if RSI Profile agrees with V8.1b direction.
+  → If V8.1b has an active LONG and RSI Profile fires LONG → "confluence confirms your trade"
+  → If RSI Profile fires LONG but V8.1b hasn't entered → "RSI Profile sees opportunity, wait for V8.1b entry signal"
+  → NEVER tell the trader to enter based on RSI Profile alone
+- SPY_VIX alerts = SUPPORTING context
+  → Same rules as RSI Profile — confirms or warns, doesn't override V8.1b
+  → SPY/VIX confidence score is useful context for sizing, not for entry decisions
+
+RESPONSE FORMAT:
+1. Start with VERDICT: "TAKE IT" / "SKIP" / "HOLD" / "BANK PROFIT" / "CUT LOSS" / "CONTEXT NOTED"
+   - Use "CONTEXT NOTED" for RSI_PROFILE and SPY_VIX alerts (they're not entries)
+   - For CONTEXT NOTED: state whether it agrees/disagrees with current V8.1b position
 2. One sentence explaining WHY (reference confluence + database stats)
-3. If multiple indicators agree, highlight it: "Triple confluence — all 3 systems say LONG"
-4. If they disagree, say which ones and why it matters
+3. For V8.1b entries: check DB for recent RSI_PROFILE and SPY_VIX signals — do they agree?
+4. Keep it SHORT — 2-3 sentences max, no headers, no bullet lists
 5. End with: [HIGH CONFIDENCE], [MEDIUM CONFIDENCE], or [LOW CONFIDENCE]
 
-CONFLUENCE SCORING:
+CONFLUENCE SCORING (only for V8.1b entry/reversal alerts):
 - 3/3 indicators agree = HIGH confidence (mention "triple confluence")
 - 2/3 agree = MEDIUM confidence (note the disagreeing one)
-- 1/3 or 0/3 = LOW confidence (recommend skipping)
-- No other signals recently = judge on this signal alone using database history"""
+- 1/3 or 0/3 = LOW confidence (recommend skipping or reduced size)
+- No other signals recently = judge on V8.1b signal alone using database history"""
 
     try:
         response = requests.post(
@@ -1293,6 +1332,7 @@ CONFLUENCE SCORING:
 # DISCORD — CLEAN TEXT FORMAT (matches TV alert style)
 # ===================================================
 ALERT_STYLES = {
+    # V8.1b alerts
     "ENTRY":          {"emoji": "🟢", "color": 5763719,  "label": "ENTRY"},
     "RE_ENTRY":       {"emoji": "🔁", "color": 3447003,  "label": "RE-ENTRY"},
     "SESSION_CLOSE":  {"emoji": "⏸",  "color": 10070709, "label": "4PM CLOSE"},
@@ -1305,6 +1345,17 @@ ALERT_STYLES = {
     "REGIME_SHIFT":   {"emoji": "🌡️", "color": 16750848, "label": "REGIME SHIFT"},
     "NO_ENTRY":       {"emoji": "⏸",  "color": 16750848, "label": "NO-ENTRY ZONE"},
     "SESSION_OPEN":   {"emoji": "🔔", "color": 3066993,  "label": "SESSION OPEN"},
+    # RSI Profile alerts
+    "RSI_PROFILE_LONG":           {"emoji": "🎯", "color": 5763719,  "label": "RSI PROFILE — LONG CONFIRMED"},
+    "RSI_PROFILE_SHORT":          {"emoji": "🎯", "color": 15548997, "label": "RSI PROFILE — SHORT CONFIRMED"},
+    "RSI_PROFILE_PENDING_LONG":   {"emoji": "🔵", "color": 3447003,  "label": "RSI PROFILE — LONG PENDING"},
+    "RSI_PROFILE_PENDING_SHORT":  {"emoji": "🔵", "color": 15548997, "label": "RSI PROFILE — SHORT PENDING"},
+    # SPY/VIX alerts
+    "SPY_VIX_ENTRY":  {"emoji": "📊", "color": 3447003,  "label": "SPY/VIX SIGNAL"},
+    "SPY_VIX_TP":     {"emoji": "🎯", "color": 5763719,  "label": "SPY/VIX TP HIT"},
+    # News
+    "NEWS_IMPACT":    {"emoji": "📰", "color": 16750848, "label": "NEWS ALERT"},
+    # Fallback
     "PARSE_ERROR":    {"emoji": "❓", "color": 9807270,  "label": "UNKNOWN"},
 }
 
@@ -1498,10 +1549,22 @@ def forward_to_discord(alert_data, claude_analysis="", claude_confidence="", is_
 # ===================================================
 @app.route("/", methods=["GET"])
 def health():
+    db_ok = False
+    db_count = 0
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM alerts")
+        db_count = c.fetchone()[0]
+        conn.close()
+        db_ok = True
+    except Exception:
+        pass
     return jsonify({
         "status": "running", "service": "OneMP11 Alert Server",
-        "version": "2.2 (V8.1b synced)", "claude": ENABLE_CLAUDE,
-        "discord": bool(DISCORD_WEBHOOK_URL), "stats_7d": get_stats(7)
+        "version": "2.2 (V8.1b + SPY/VIX + RSI Profile)", "claude": ENABLE_CLAUDE,
+        "discord": bool(DISCORD_WEBHOOK_URL), "db_ok": db_ok, "db_path": DB_PATH,
+        "db_alerts": db_count, "stats_7d": get_stats(7)
     })
 
 
@@ -1611,6 +1674,50 @@ def news():
     with news_cache_lock:
         items = list(news_cache)
     return jsonify({"enabled": ENABLE_NEWS, "headlines": items, "count": len(items)})
+
+
+@app.route("/download-db", methods=["GET"])
+def download_db():
+    """Download the SQLite database file for offline analysis"""
+    secret = request.args.get("secret", "")
+    if secret != WEBHOOK_SECRET:
+        return jsonify({"error": "Add ?secret=your_webhook_secret to download"}), 403
+    try:
+        import shutil
+        from flask import send_file
+        # Copy to temp file (avoid locking issues)
+        tmp_path = DB_PATH + ".download"
+        shutil.copy2(DB_PATH, tmp_path)
+        return send_file(tmp_path, as_attachment=True, download_name="onemp11_alerts.db",
+                         mimetype="application/x-sqlite3")
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
+
+
+@app.route("/db-stats", methods=["GET"])
+def db_stats():
+    """Quick database health check — row counts by source and type"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        c.execute("SELECT COUNT(*) FROM alerts")
+        total = c.fetchone()[0]
+        c.execute("SELECT source, COUNT(*) FROM alerts GROUP BY source")
+        by_source = {row[0] or "V8_1B": row[1] for row in c.fetchall()}
+        c.execute("SELECT alert_type, COUNT(*) FROM alerts GROUP BY alert_type ORDER BY COUNT(*) DESC")
+        by_type = {row[0]: row[1] for row in c.fetchall()}
+        c.execute("SELECT MIN(timestamp), MAX(timestamp) FROM alerts")
+        date_range = c.fetchone()
+        conn.close()
+        return jsonify({
+            "total_alerts": total,
+            "by_source": by_source,
+            "by_type": by_type,
+            "first_alert": date_range[0],
+            "last_alert": date_range[1],
+        })
+    except Exception as e:
+        return jsonify({"error": str(e)}), 500
 
 
 @app.route("/weekly-summary", methods=["GET"])
