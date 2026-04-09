@@ -1247,7 +1247,6 @@ def analyze_with_claude(alert_data, recent_alerts):
 {news_context}
 
 CURRENT ALERT (source: {source}):
-  Chart: {CHART_URL}
   Type: {alert_data.get('alert_type', '')}
   Direction: {alert_data.get('direction', '')}
   Price: {alert_data.get('price', 0)}
@@ -1491,6 +1490,12 @@ def build_discord_payload(alert_data, claude_analysis="", claude_confidence="", 
             lines.append(" │ ".join(pnl_parts2))
 
     description = "\n".join(lines)
+
+    # Add chart link for quick access (only for actionable alerts)
+    actionable = ["ENTRY", "RE_ENTRY", "REVERSAL", "MILESTONE_UP", "MILESTONE_DOWN",
+                   "SPY_VIX_ENTRY", "RSI_PROFILE_LONG", "RSI_PROFILE_SHORT"]
+    if CHART_URL and atype in actionable:
+        description += f"\n\n📊 [Live Chart]({CHART_URL})"
 
     main_embed = {
         "description": description,
