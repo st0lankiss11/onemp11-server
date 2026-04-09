@@ -1211,7 +1211,73 @@ def parse_alert(raw_json):
 
 
 # ===================================================
-# CLAUDE ANALYSIS
+# CHART IMAGE FETCHER (for Claude Vision)
+# ===================================================
+chart_image_cache = {"data": None, "timestamp": 0}
+CHART_IMAGE_CACHE_SECONDS = 60  # Re-fetch chart image max every 60 seconds
+
+
+def fetch_chart_image():
+    """Fetch chart preview image from TradingView published chart"""
+    if not CHART_URL:
+        return None
+
+    # Check cache
+    now = time.time()
+    if chart_image_cache["data"] and (now - chart_image_cache["timestamp"]) < CHART_IMAGE_CACHE_SECONDS:
+        return chart_image_cache["data"]
+
+    try:
+        # Step 1: Fetch the chart page HTML to find og:image
+        headers = {"User-Agent": "Mozilla/5.0 (compatible; OneMP11Bot/1.0)"}
+        page = requests.get(CHART_URL, headers=headers, timeout=10)
+        if page.status_code != 200:
+            print(f"CHART: Page fetch failed: {page.status_code}")
+            return None
+
+        # Step 2: Extract og:image URL from meta tags
+        import re as re_mod
+        og_match = re_mod.search(r'<meta\s+property=["\']og:image["\']\s+content=["\'](https?://[^"\']+)["\']', page.text)
+        if not og_match:
+            # Try alternative pattern
+            og_match = re_mod.search(r'content=["\'](https?://[^"\']+)["\'].*?property=["\']og:image["\']', page.text)
+        if not og_match:
+            print("CHART: No og:image found in page")
+            return None
+
+        image_url = og_match.group(1)
+        print(f"CHART: Found image URL: {image_url[:80]}")
+
+        # Step 3: Download the image
+        img_response = requests.get(image_url, headers=headers, timeout=10)
+        if img_response.status_code != 200:
+            print(f"CHART: Image download failed: {img_response.status_code}")
+            return None
+
+        # Step 4: Base64 encode
+        import base64
+        img_b64 = base64.b64encode(img_response.content).decode("utf-8")
+
+        # Detect media type
+        content_type = img_response.headers.get("Content-Type", "image/png")
+        if "jpeg" in content_type or "jpg" in content_type:
+            media_type = "image/jpeg"
+        else:
+            media_type = "image/png"
+
+        result = {"base64": img_b64, "media_type": media_type}
+        chart_image_cache["data"] = result
+        chart_image_cache["timestamp"] = now
+        print(f"CHART: Image cached ({len(img_b64) // 1024}KB)")
+        return result
+
+    except Exception as e:
+        print(f"CHART: Error fetching: {e}")
+        return None
+
+
+# ===================================================
+# CLAUDE ANALYSIS (with optional Vision)
 # ===================================================
 def analyze_with_claude(alert_data, recent_alerts):
     if not ANTHROPIC_API_KEY or not ENABLE_CLAUDE:
@@ -1295,6 +1361,53 @@ CONFLUENCE SCORING (only for V8.1b entry/reversal alerts):
 - No other signals recently = judge on V8.1b signal alone using database history"""
 
     try:
+        # Fetch chart image for V8.1b actionable alerts
+        chart_image = None
+        vision_types = ["ENTRY", "RE_ENTRY", "REVERSAL", "MILESTONE_UP", "MILESTONE_DOWN"]
+        if alert_data.get("alert_type", "") in vision_types:
+            chart_image = fetch_chart_image()
+
+        # Build messages — with or without Vision
+        if chart_image:
+            messages = [{"role": "user", "content": [
+                {"type": "image", "source": {
+                    "type": "base64",
+                    "media_type": chart_image["media_type"],
+                    "data": chart_image["base64"]
+                }},
+                {"type": "text", "text": prompt + """
+
+A chart screenshot is attached. Here is what each visual element means:
+
+CANDLE COLORS (CVD Flow — buying/selling pressure):
+- Bright Green = STRONG BULL (CVD momentum > +60, heavy buying)
+- Cyan/Light Blue = WEAK BULL (momentum 0 to +60, fading or building)
+- Orange = WEAK BEAR (momentum 0 to -60, light selling)
+- Pink/Red = STRONG BEAR (momentum < -60, heavy selling)
+- Green→Cyan transition = momentum fading, watch for reversal
+- Cyan→Orange = flow flipped bearish
+
+LINES ON CHART:
+- Green line (Kalman VWAP) = V8.1b's main trend line. Price above = bullish, below = bearish. Slope direction matters.
+- Blue line (EMA 26) = Short-term moving average for trend reference
+- RSI Trend Line Pro (changes color): Cyan = BULLISH slope, Purple = BEARISH slope, Yellow = NEUTRAL
+- RSI TL Pro Upper Band (dashed above) = Overbought envelope
+- RSI TL Pro Lower Band (dashed below) = Oversold envelope
+- When RSI TL Pro turns from Cyan to Yellow = early warning trend weakening
+- When RSI TL Pro turns from Yellow to Purple = confirmed bearish
+
+KEY PATTERNS TO IDENTIFY:
+- Candles green but RSI TL turning yellow/purple = DIVERGENCE (flow says buy but trend says weakening)
+- Price above Kalman + RSI TL cyan + green candles = STRONG alignment, hold
+- Price near RSI TL upper band = extended, giveback risk
+- Candles shifting cyan→orange while Kalman still rising = early reversal warning
+
+Describe what you see on the chart in 1 sentence, then give your verdict."""}
+            ]}]
+            print("CLAUDE: Using Vision (chart image attached)")
+        else:
+            messages = [{"role": "user", "content": prompt}]
+
         response = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={
@@ -1304,10 +1417,10 @@ CONFLUENCE SCORING (only for V8.1b entry/reversal alerts):
             },
             json={
                 "model": "claude-sonnet-4-20250514",
-                "max_tokens": 250,
-                "messages": [{"role": "user", "content": prompt}]
+                "max_tokens": 300,
+                "messages": messages
             },
-            timeout=30
+            timeout=45
         )
 
         if response.status_code == 200:
