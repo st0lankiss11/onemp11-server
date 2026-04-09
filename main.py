@@ -67,6 +67,7 @@ def news_poll_loop():
     while True:
         try:
             fetch_news()
+            check_news_impact()
         except Exception as e:
             print(f"NEWS: Poll error: {e}")
         time.sleep(FJ_POLL_INTERVAL)
@@ -102,10 +103,272 @@ def get_news_context(max_items=5):
 
 
 # ===================================================
+# AUTONOMOUS NEWS IMPACT ALERTS
+# ===================================================
+HIGH_IMPACT_KEYWORDS = [
+    # Fed / Monetary
+    "fomc", "fed rate", "rate decision", "rate cut", "rate hike", "powell",
+    "federal reserve", "quantitative", "tapering", "hawkish", "dovish",
+    # Economic data
+    "nfp", "non-farm", "payroll", "cpi", "inflation", "ppi", "gdp",
+    "jobless claims", "unemployment", "retail sales", "ism",
+    # Geopolitical
+    "tariff", "trade war", "sanction", "invasion", "war ", "missile",
+    "nato", "china retaliate", "escalat", "nuclear",
+    # Market events
+    "circuit breaker", "halt", "flash crash", "margin call", "liquidat",
+    "bank failure", "default", "downgrade", "credit rating",
+    # ES specific
+    "s&p 500", "s&p500", "es futures", "spx", "equity futures",
+]
+
+seen_headlines = set()
+seen_headlines_lock = threading.Lock()
+
+
+def get_active_trade():
+    """Query DB for most recent active trade (entry without matching exit)"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        # Get last entry/re-entry/reversal
+        c.execute("""
+            SELECT alert_type, direction, price, timestamp, tl_state, rsi, adx, open_pnl
+            FROM alerts
+            WHERE alert_type IN ('ENTRY', 'RE_ENTRY', 'REVERSAL')
+            ORDER BY id DESC LIMIT 1
+        """)
+        last_entry = c.fetchone()
+
+        if not last_entry:
+            conn.close()
+            return None
+
+        # Check if there's a more recent exit
+        c.execute("""
+            SELECT alert_type FROM alerts
+            WHERE alert_type IN ('SESSION_CLOSE', 'FRIDAY_CLOSE', 'REVERSAL')
+            AND id > (SELECT MAX(id) FROM alerts WHERE alert_type IN ('ENTRY', 'RE_ENTRY'))
+            ORDER BY id DESC LIMIT 1
+        """)
+        last_exit = c.fetchone()
+        conn.close()
+
+        # If last exit is after last entry, no active trade
+        # (REVERSAL counts as both exit + entry, so it's still "active")
+        if last_exit and last_entry[0] != 'REVERSAL':
+            return None
+
+        return {
+            "direction": last_entry[1],
+            "price": last_entry[2],
+            "timestamp": last_entry[3],
+            "tl_state": last_entry[4],
+            "rsi": last_entry[5],
+            "adx": last_entry[6],
+            "open_pnl": last_entry[7],
+        }
+    except Exception as e:
+        print(f"NEWS: Active trade query error: {e}")
+        return None
+
+
+def is_high_impact(headline):
+    """Check if headline contains high-impact keywords"""
+    lower = headline.lower()
+    for kw in HIGH_IMPACT_KEYWORDS:
+        if kw in lower:
+            return True
+    return False
+
+
+def analyze_news_impact(headline, active_trade):
+    """Breaking news + active trade → assess risk to position"""
+    if not ANTHROPIC_API_KEY or not ENABLE_CLAUDE:
+        return "", ""
+
+    prompt = f"""{SYSTEM_KNOWLEDGE}
+
+BREAKING NEWS DETECTED:
+  Headline: {headline}
+
+ACTIVE TRADE:
+  Direction: {active_trade['direction']}
+  Entry Price: {active_trade['price']}
+  TL State: {active_trade['tl_state']}
+  RSI at entry: {active_trade['rsi']}
+  ADX at entry: {active_trade['adx']}
+
+Assess this news headline's impact on the active {active_trade['direction']} ES position.
+Be specific: Is this bullish, bearish, or neutral for ES?
+If it SUPPORTS the trade → say "supports position, hold through"
+If it THREATENS the trade → say "threatens position, consider taking profit" or "tighten mental stop"
+If it creates volatility → say "expect chop, widen awareness"
+Keep it to 2-3 sentences. End with one of:
+[HIGH RISK] — directly threatens position, consider manual exit or take profit
+[MEDIUM RISK] — creates uncertainty, heighten awareness
+[LOW RISK] — unlikely to impact or supports current trade"""
+
+    try:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-sonnet-4-20250514", "max_tokens": 200, "messages": [{"role": "user", "content": prompt}]},
+            timeout=30
+        )
+        if response.status_code == 200:
+            text = response.json()["content"][0]["text"]
+            risk = "MEDIUM"
+            if "[HIGH RISK]" in text: risk = "HIGH"
+            elif "[LOW RISK]" in text: risk = "LOW"
+            clean = text.replace("[HIGH RISK]", "").replace("[MEDIUM RISK]", "").replace("[LOW RISK]", "").strip()
+            return clean, risk
+    except Exception as e:
+        print(f"NEWS: Claude impact error: {e}")
+    return "", ""
+
+
+def analyze_news_opportunity(headline):
+    """Breaking news while FLAT → assess entry opportunity"""
+    if not ANTHROPIC_API_KEY or not ENABLE_CLAUDE:
+        return "", ""
+
+    prompt = f"""{SYSTEM_KNOWLEDGE}
+
+BREAKING NEWS DETECTED (currently FLAT — no open ES position):
+  Headline: {headline}
+
+Assess this news headline's impact on ES futures for someone with NO position:
+1. Is this bullish, bearish, or neutral for ES?
+2. Does this create a potential entry opportunity? If so, which direction?
+   e.g. "Bearish headline may create oversold dip — watch for LONG entry signal"
+   e.g. "Rate hike surprise — expect sustained selling, watch for SHORT entry"
+3. Key timing: Is the move likely immediate or will it develop over hours?
+4. Volatility warning if applicable
+Keep it to 2-3 sentences. End with one of:
+[OPPORTUNITY] — likely creates a tradeable move, watch for system entry signal
+[WATCH] — creates uncertainty, be ready for signals in either direction
+[NO ACTION] — unlikely to move ES meaningfully"""
+
+    try:
+        response = requests.post(
+            "https://api.anthropic.com/v1/messages",
+            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
+            json={"model": "claude-sonnet-4-20250514", "max_tokens": 200, "messages": [{"role": "user", "content": prompt}]},
+            timeout=30
+        )
+        if response.status_code == 200:
+            text = response.json()["content"][0]["text"]
+            level = "WATCH"
+            if "[OPPORTUNITY]" in text: level = "OPPORTUNITY"
+            elif "[NO ACTION]" in text: level = "NO ACTION"
+            clean = text.replace("[OPPORTUNITY]", "").replace("[WATCH]", "").replace("[NO ACTION]", "").strip()
+            return clean, level
+    except Exception as e:
+        print(f"NEWS: Claude opportunity error: {e}")
+    return "", ""
+
+
+def send_news_alert(headline, active_trade, analysis, risk_level):
+    """Send news alert to Discord — works for both in-trade and flat"""
+    if not DISCORD_WEBHOOK_URL:
+        return
+
+    risk_config = {
+        "HIGH":        {"emoji": "🚨", "color": 15548997, "label": "HIGH RISK"},
+        "MEDIUM":      {"emoji": "⚠️", "color": 16750848, "label": "MEDIUM RISK"},
+        "LOW":         {"emoji": "ℹ️", "color": 3447003,  "label": "LOW RISK"},
+        "OPPORTUNITY": {"emoji": "🔔", "color": 5763719,  "label": "OPPORTUNITY"},
+        "WATCH":       {"emoji": "👀", "color": 16750848, "label": "WATCH"},
+        "NO ACTION":   {"emoji": "ℹ️", "color": 9807270,  "label": "NO ACTION"},
+    }
+    cfg = risk_config.get(risk_level, risk_config["MEDIUM"])
+
+    lines = []
+    lines.append(f"📰 **NEWS ALERT**")
+    lines.append("")
+    lines.append(f"**{headline}**")
+    lines.append("")
+
+    if active_trade:
+        dir_emoji = "🟢" if active_trade["direction"] == "LONG" else "🔴"
+        lines.append(f"Position: {dir_emoji} **{active_trade['direction']}** @ ${active_trade['price']:,.2f}")
+    else:
+        lines.append("Position: **FLAT** — no open trade")
+
+    lines.append("")
+    lines.append(f"{cfg['emoji']} **{cfg['label']}**")
+    lines.append("────────────────────")
+    lines.append(analysis)
+
+    embed = {
+        "description": "\n".join(lines),
+        "color": cfg["color"],
+        "footer": {"text": "⚡ OneMP11 News Monitor"},
+        "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
+    }
+
+    try:
+        requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed], "username": "OneMP11"}, timeout=10)
+        print(f"NEWS: Sent {risk_level} alert for: {headline[:60]}")
+    except Exception as e:
+        print(f"NEWS: Discord error: {e}")
+
+    store_alert({
+        "alert_type": "NEWS_IMPACT",
+        "direction": active_trade["direction"] if active_trade else "FLAT",
+        "price": active_trade["price"] if active_trade else 0,
+        "verdict": headline[:200],
+        "claude_analysis": analysis,
+        "claude_confidence": risk_level,
+        "timestamp": datetime.utcnow().isoformat(),
+    })
+
+
+def check_news_impact():
+    """Check new headlines for high-impact events — alerts whether in trade or not"""
+    with news_cache_lock:
+        items = list(news_cache)
+
+    if not items:
+        return
+
+    active_trade = get_active_trade()
+
+    for item in items[:5]:  # Check 5 most recent
+        title = item.get("title", "")
+        if not title:
+            continue
+
+        # Dedup — only alert once per headline
+        with seen_headlines_lock:
+            if title in seen_headlines:
+                continue
+
+        if is_high_impact(title):
+            with seen_headlines_lock:
+                seen_headlines.add(title)
+                if len(seen_headlines) > 500:
+                    seen_headlines.clear()
+
+            print(f"NEWS: High-impact detected: {title[:60]}")
+
+            if active_trade:
+                analysis, risk = analyze_news_impact(title, active_trade)
+            else:
+                analysis, risk = analyze_news_opportunity(title)
+
+            if analysis:
+                send_news_alert(title, active_trade, analysis, risk)
+            break  # One alert per poll cycle
+
+
+# ===================================================
 # V8.1b KNOWLEDGE BASE (updated — no SL/Smart)
 # ===================================================
 SYSTEM_KNOWLEDGE = """
 You are the OneMP11 V8.1b trading system analyst for ES futures.
+Your job: assess each alert using the system's rules, database history, and market context.
 
 SIGNAL GENERATION:
 - Entries require ALL four: CVD Momentum > 60, Histogram > 5, Price above/below Kalman VWAP, Kalman slope confirms direction
@@ -117,51 +380,89 @@ SIGNAL GENERATION:
 TL SPREAD (ATR-based):
 - TIGHT (< 0.5x ATR): Price hugging TL — strong conviction
 - RIDING (0.5-1.0x ATR): Normal trend following
-- EXTENDED (1.0-2.0x ATR): Stretched — trail tight
+- EXTENDED (1.0-2.0x ATR): Getting stretched
 - STRETCHED (> 2.0x ATR): Overextended — high reversion risk
 
 SESSION FILTER:
-- No-entry zone: 2pm-8pm CT (blocks entries + re-entries, NOT reversals)
+- No-entry zone: 2pm-5pm CT (blocks entries + re-entries, NOT reversals)
 - Force close: 4pm CT Mon-Thu (always ON)
 - Friday auto-close: 4pm (market closed Fri 4pm - Sun 5pm)
-
-MILESTONE OUTCOME TRACKING:
-- System tracks what happens AFTER milestones are hit
-- M+ Win row: How many trades that hit +10/+20/+30 ended profitable
-- M- Rcvr row: How many trades that hit -15/-25 eventually recovered
-- Historical: 100% of trades hitting +10/+20/+30 ended positive (small sample)
-- Historical: 75% of trades hitting -15 recovered
+- Session open: 5pm CT (ES futures reopen)
 
 ALERT TYPES:
-- ENTRY: Fresh long/short — all 4 conditions aligned
+- ENTRY: Fresh long/short — all 4 conditions aligned (strongest signal)
 - RE_ENTRY: Momentum flipped back to trend after pullback
 - REVERSAL: All conditions flipped — exits current AND enters opposite
-- SESSION_CLOSE: Force exit at 4pm CT Mon-Thu
-- FRIDAY_CLOSE: Force exit at 4pm Friday
-- TREND_OVER: Price crossed TL while flat
-- MILESTONE_UP: Trade hit +10, +20, or +30 pts
-- MILESTONE_DOWN: Trade hit -15 or -25 pts
+- SESSION_CLOSE / FRIDAY_CLOSE: Force exit at 4pm CT
+- MILESTONE_UP: Trade hit +10, +20, or +30 pts profit
+- MILESTONE_DOWN: Trade hit -15 or -25 pts loss
 - MARKET_CHECK: 10am CST daily snapshot
 - REGIME_SHIFT: VIX regime changed
 - NO_ENTRY: 2pm block started
-- SESSION_OPEN: 8pm session open
+- SESSION_OPEN: 5pm session open
+- NEWS_IMPACT: High-impact news detected while trade is active
 
-TRAFFIC LIGHT SYSTEM (data-driven hold/bank signal):
-- 3 checks computed on every bar, shown on milestone alerts + table
-- Check 1 (RSI zone): 🟢 55-65 (9% giveback) │ 🟡 45-55 or 65-70 │ 🔴 <45 or >70 (40% giveback)
-- Check 2 (Slope magnitude): 🟢 medium slope (goldilocks) │ 🟡 weak │ 🔴 too steep (exhausted)
-- Check 3 (Momentum fade): 🟢 not fading │ 🔴 declining 2+ bars (30% giveback)
-- 🟢🟢🟢 HOLD = all three green, safest hold zone
-- 🟢🟢🔴 LEAN HOLD = mostly safe, one concern
-- 🟡🔴🟢 CAUTION = multiple warnings, tighten mentally
-- 🔴🔴🔴 BANK IT = all three red, high probability of giveback
-- This is DISPLAY ONLY — does not change entries or exits. Trader uses it for discretionary sizing.
+HOW TO ANALYZE EACH FIELD:
+
+CVD Momentum (-100 to +100):
+- Above +60 = strong buying flow (entry quality)
+- 0 to +60 = weak buying (fading or building)
+- Below -60 = strong selling flow
+- CRITICAL: If CVD momentum direction DISAGREES with trade direction, flag it
+
+Candle Color (from CVD):
+- STRONG_BULL / STRONG_BEAR = entry-quality flow, high conviction
+- WEAK_BULL / WEAK_BEAR = flow exists but not strong
+- NEUTRAL = dead flow, no directional edge
+- DIVERGENCE ALERT: If trade is LONG but candle is WEAK_BEAR or worse → flag as "flow diverging"
+- DIVERGENCE ALERT: If candle was STRONG_BULL and shifted to WEAK_BULL → flag as "flow fading"
+
+Traffic Light (hold/bank signal from data analysis):
+- GGG = all green → HOLD with confidence (mention this explicitly)
+- GGR / GRG = lean hold, one concern → note which check failed
+- RRG / RGR / GRR = caution → recommend tightening mentally
+- RRR = all red → strongly suggest banking profit if in the money
+- ALWAYS mention the traffic light reading in your analysis
+
+Kalman Slope:
+- Positive = TL rising (bullish bias)
+- Negative = TL falling (bearish bias)
+- Magnitude > 0.3 = steep/fast trend (may exhaust)
+- Magnitude < 0.05 = flat/indecisive
+
+Spread Ratio (ATR-normalized):
+- < 0.5 = TIGHT (strong conviction zone)
+- 0.5-1.0 = RIDING (healthy trend)
+- 1.0-2.0 = EXTENDED (stretched)
+- > 2.0 = STRETCHED (high reversion risk)
+- If spread ratio > 1.5 AND RSI extreme → giveback probability HIGH
+
+RSI Cross-Market Context:
+- ES RSI 55-65 = sweet spot (only 9% giveback historically)
+- ES RSI < 45 or > 70 = danger zone (40% giveback)
+- VIX RSI > 60 = fear rising (bearish pressure)
+- VIX RSI < 30 = complacency (bullish support)
+- CL RSI diverging from ES RSI = cross-market stress
+
+NEWS IMPACT RULES:
+- HIGH IMPACT events (Fed decisions, CPI, NFP, tariffs, geopolitical escalation):
+  → If headline clearly affects ES direction AND you have an active trade → flag risk level
+  → Tariffs/trade war → bearish ES pressure
+  → Fed dovish/rate cuts → bullish ES
+  → Surprise economic miss → volatile, direction depends on context
+- MEDIUM IMPACT (earnings, sector news, oil spikes):
+  → Note but don't change confidence unless directly relevant to ES
+- LOW IMPACT (general commentary, analyst opinions):
+  → Ignore for trading purposes
+- NEVER override the system's signal based on news alone
+- DO mention when news creates heightened volatility risk
 
 CONFIDENCE RULES:
-- HIGH: Entry/reversal with ADX>25, strong momentum, TL TIGHT/RIDING, RSI 40-60
-- MEDIUM: Mostly aligned but one concern (extended TL, fading mom, session risk)
-- LOW: Multiple concerns (low ADX, STRETCHED TL, RSI extreme, midday, against VIX)
+- HIGH: Strong signal alignment + database supports + traffic green + no conflicting news
+- MEDIUM: Mostly aligned but one concern (extended TL, fading momentum, session risk, cautious traffic light)
+- LOW: Multiple concerns (low ADX, STRETCHED TL, RSI extreme, flow diverging, traffic red, adverse news)
 - ADX value of -1 means "not included in this alert type" — do NOT treat as zero/weak
+- ALWAYS reference specific database stats (e.g. "Your LONG trades from RIDING have won 72%")
 """
 
 
@@ -178,13 +479,26 @@ def init_db():
             exit_pts REAL, daily_pnl REAL, weekly_pnl REAL, monthly_pnl REAL,
             total_pnl REAL, tl_spread REAL, tl_state TEXT, rsi REAL,
             vix_rsi REAL, compare_rsi REAL, adx REAL, verdict TEXT,
-            claude_analysis TEXT, claude_confidence TEXT, raw_json TEXT, session TEXT
+            claude_analysis TEXT, claude_confidence TEXT, raw_json TEXT, session TEXT,
+            cvd_mom REAL DEFAULT 0, histogram REAL DEFAULT 0,
+            kalman_slope REAL DEFAULT 0, candle_color TEXT DEFAULT '',
+            traffic TEXT DEFAULT '', regime TEXT DEFAULT '',
+            spread_ratio REAL DEFAULT 0, open_pnl REAL DEFAULT 0
         )
     """)
-    try:
-        c.execute("ALTER TABLE alerts ADD COLUMN session TEXT DEFAULT ''")
-    except sqlite3.OperationalError:
-        pass
+    # Migration for existing DBs — add new columns if missing
+    new_cols = [
+        ("session", "TEXT DEFAULT ''"), ("cvd_mom", "REAL DEFAULT 0"),
+        ("histogram", "REAL DEFAULT 0"), ("kalman_slope", "REAL DEFAULT 0"),
+        ("candle_color", "TEXT DEFAULT ''"), ("traffic", "TEXT DEFAULT ''"),
+        ("regime", "TEXT DEFAULT ''"), ("spread_ratio", "REAL DEFAULT 0"),
+        ("open_pnl", "REAL DEFAULT 0"),
+    ]
+    for col, ctype in new_cols:
+        try:
+            c.execute(f"ALTER TABLE alerts ADD COLUMN {col} {ctype}")
+        except sqlite3.OperationalError:
+            pass
     conn.commit()
     conn.close()
 
@@ -219,8 +533,10 @@ def store_alert(data):
             timestamp, alert_type, direction, price, exit_pts,
             daily_pnl, weekly_pnl, monthly_pnl, total_pnl,
             tl_spread, tl_state, rsi, vix_rsi, compare_rsi,
-            adx, verdict, claude_analysis, claude_confidence, raw_json, session
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            adx, verdict, claude_analysis, claude_confidence, raw_json, session,
+            cvd_mom, histogram, kalman_slope, candle_color, traffic, regime,
+            spread_ratio, open_pnl
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
     """, (
         data.get("timestamp", ""), data.get("alert_type", ""),
         data.get("direction", ""), data.get("price", 0),
@@ -231,7 +547,11 @@ def store_alert(data):
         data.get("vix_rsi", 0), data.get("compare_rsi", 0),
         data.get("adx", -1), data.get("verdict", ""),
         data.get("claude_analysis", ""), data.get("claude_confidence", ""),
-        data.get("raw_json", ""), session
+        data.get("raw_json", ""), session,
+        data.get("cvd_mom", 0), data.get("histogram", 0),
+        data.get("kalman_slope", 0), data.get("candle_color", ""),
+        data.get("traffic", ""), data.get("regime", ""),
+        data.get("spread_ratio", 0), data.get("open_pnl", 0)
     ))
     conn.commit()
     conn.close()
@@ -458,6 +778,8 @@ def parse_alert(raw_json):
         "daily_pnl": 0, "weekly_pnl": 0, "monthly_pnl": 0, "total_pnl": 0,
         "tl_spread": 0, "tl_state": "", "rsi": 0, "vix_rsi": 0,
         "compare_rsi": 0, "adx": -1, "verdict": "", "traffic": "",
+        "cvd_mom": 0, "histogram": 0, "kalman_slope": 0, "candle_color": "",
+        "regime": "", "spread_ratio": 0, "open_pnl": 0,
         "raw_json": json.dumps(raw_json) if isinstance(raw_json, dict) else str(raw_json),
         "timestamp": datetime.utcnow().isoformat()
     }
@@ -580,6 +902,36 @@ def parse_alert(raw_json):
         if traffic_match:
             data["traffic"] = f"{traffic_match.group(1)} {traffic_match.group(2)}"
 
+        # [D] Compact data line — parse all metrics
+        # Format: [D] M:85|H:42|S:0.15|C:SB|T:GGR|R:NORMAL|SR:1.23|OP:+15.2
+        data_match = re.search(r'\[D\]\s*(.+?)$', content, re.MULTILINE)
+        if data_match:
+            data_str = data_match.group(1)
+            for pair in data_str.split("|"):
+                pair = pair.strip()
+                if pair.startswith("M:"):
+                    try: data["cvd_mom"] = float(pair[2:])
+                    except: pass
+                elif pair.startswith("H:"):
+                    try: data["histogram"] = float(pair[2:])
+                    except: pass
+                elif pair.startswith("S:"):
+                    try: data["kalman_slope"] = float(pair[2:])
+                    except: pass
+                elif pair.startswith("C:"):
+                    color_map = {"SB": "STRONG_BULL", "WB": "WEAK_BULL", "SR": "STRONG_BEAR", "WR": "WEAK_BEAR", "N": "NEUTRAL"}
+                    data["candle_color"] = color_map.get(pair[2:].strip(), pair[2:].strip())
+                elif pair.startswith("T:"):
+                    data["traffic"] = pair[2:].strip() if not data.get("traffic") else data["traffic"]
+                elif pair.startswith("R:"):
+                    data["regime"] = pair[2:].strip()
+                elif pair.startswith("SR:"):
+                    try: data["spread_ratio"] = float(pair[3:])
+                    except: pass
+                elif pair.startswith("OP:"):
+                    try: data["open_pnl"] = float(pair[3:])
+                    except: pass
+
     except Exception as e:
         data["alert_type"] = "PARSE_ERROR"
         data["verdict"] = str(e)
@@ -630,6 +982,12 @@ CURRENT ALERT:
   TL: {alert_data.get('tl_spread', 0)} ({alert_data.get('tl_state', '')})
   Verdict: {alert_data.get('verdict', 'none')}
   Traffic Light: {alert_data.get('traffic', 'none')}
+  CVD Momentum: {alert_data.get('cvd_mom', 0):.0f}
+  Candle Color: {alert_data.get('candle_color', 'unknown')}
+  Kalman Slope: {alert_data.get('kalman_slope', 0):.2f}
+  Regime: {alert_data.get('regime', 'unknown')}
+  Spread Ratio: {alert_data.get('spread_ratio', 0):.2f}x ATR
+  Open P&L: {alert_data.get('open_pnl', 0):+.1f}pts
   Session: {get_session_from_time(alert_data.get('timestamp', ''))}
 
 Brief assessment (2-3 sentences). Reference database patterns with specific numbers.
@@ -772,6 +1130,19 @@ def build_discord_payload(alert_data, claude_analysis="", claude_confidence="", 
         if tech_parts2:
             lines.append(" │ ".join(tech_parts2))
 
+        # CVD Flow line (candle color + momentum)
+        candle_color = alert_data.get("candle_color", "")
+        cvd_mom = alert_data.get("cvd_mom", 0)
+        if candle_color or cvd_mom:
+            color_icons = {"STRONG_BULL": "🟢", "WEAK_BULL": "🔵", "STRONG_BEAR": "🔴", "WEAK_BEAR": "🟠", "NEUTRAL": "⚪"}
+            c_icon = color_icons.get(candle_color, "")
+            c_short = candle_color.replace("_", " ").title() if candle_color else ""
+            flow_str = f"Flow: {c_icon} {c_short}" if c_icon else ""
+            if cvd_mom:
+                flow_str += f" │ Mom: {cvd_mom:+.0f}" if flow_str else f"Mom: {cvd_mom:+.0f}"
+            if flow_str:
+                lines.append(flow_str)
+
     # TL Spread
     tl_spread = alert_data.get("tl_spread", 0)
     tl_state = alert_data.get("tl_state", "")
@@ -886,7 +1257,7 @@ def webhook():
     recent = get_recent_alerts(10)
 
     claude_analysis, claude_confidence = "", ""
-    skip_types = ["NO_ENTRY", "TREND_OVER", "REGIME_SHIFT", "SESSION_OPEN"]
+    skip_types = ["TREND_OVER"]  # Claude analyzes everything else for data collection
     if alert_data["alert_type"] not in skip_types:
         claude_analysis, claude_confidence = analyze_with_claude(alert_data, recent)
 
@@ -913,7 +1284,7 @@ def test_webhook():
     recent = get_recent_alerts(10)
 
     claude_analysis, claude_confidence = "", ""
-    skip_types = ["NO_ENTRY", "TREND_OVER", "REGIME_SHIFT", "SESSION_OPEN"]
+    skip_types = ["TREND_OVER"]  # Claude analyzes everything else for data collection
     if alert_data["alert_type"] not in skip_types:
         claude_analysis, claude_confidence = analyze_with_claude(alert_data, recent)
 
