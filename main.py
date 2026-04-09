@@ -124,6 +124,52 @@ HIGH_IMPACT_KEYWORDS = [
 
 seen_headlines = set()
 seen_headlines_lock = threading.Lock()
+NEWS_COOLDOWN_MINUTES = 5  # Min time between news alerts
+
+
+def get_headline_key(headline):
+    """Normalize headline for fuzzy dedup — first 50 chars lowercase, strip punctuation"""
+    import string
+    clean = headline.lower().translate(str.maketrans('', '', string.punctuation))
+    return clean[:50].strip()
+
+
+def was_recently_alerted(headline_key):
+    """Check if we already alerted on a similar headline recently (DB-backed, survives restarts)"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        cutoff = (datetime.utcnow() - timedelta(minutes=NEWS_COOLDOWN_MINUTES * 3)).isoformat()
+        c.execute("""
+            SELECT verdict FROM alerts
+            WHERE alert_type = 'NEWS_IMPACT' AND timestamp > ?
+            ORDER BY id DESC LIMIT 10
+        """, (cutoff,))
+        recent_news = c.fetchall()
+        conn.close()
+
+        for row in recent_news:
+            stored_key = get_headline_key(row[0]) if row[0] else ""
+            # If first 30 chars match = same story updated
+            if stored_key[:30] == headline_key[:30] and stored_key[:30] != "":
+                return True
+        return False
+    except Exception:
+        return False
+
+
+def news_on_cooldown():
+    """Check if any news alert was sent within cooldown period"""
+    try:
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
+        cutoff = (datetime.utcnow() - timedelta(minutes=NEWS_COOLDOWN_MINUTES)).isoformat()
+        c.execute("SELECT COUNT(*) FROM alerts WHERE alert_type = 'NEWS_IMPACT' AND timestamp > ?", (cutoff,))
+        count = c.fetchone()[0]
+        conn.close()
+        return count > 0
+    except Exception:
+        return False
 
 
 def get_active_trade():
@@ -326,41 +372,52 @@ def send_news_alert(headline, active_trade, analysis, risk_level):
 
 
 def check_news_impact():
-    """Check new headlines for high-impact events — alerts whether in trade or not"""
+    """Check new headlines for high-impact events, alert whether in trade or not"""
     with news_cache_lock:
         items = list(news_cache)
 
     if not items:
         return
 
+    # Cooldown: max 1 news alert per N minutes
+    if news_on_cooldown():
+        return
+
     active_trade = get_active_trade()
 
-    for item in items[:5]:  # Check 5 most recent
+    for item in items[:5]:
         title = item.get("title", "")
         if not title:
             continue
 
-        # Dedup — only alert once per headline
+        if not is_high_impact(title):
+            continue
+
+        headline_key = get_headline_key(title)
+
+        # In-memory dedup (same worker, same session)
         with seen_headlines_lock:
-            if title in seen_headlines:
+            if headline_key in seen_headlines:
                 continue
+            seen_headlines.add(headline_key)
+            if len(seen_headlines) > 500:
+                seen_headlines.clear()
 
-        if is_high_impact(title):
-            with seen_headlines_lock:
-                seen_headlines.add(title)
-                if len(seen_headlines) > 500:
-                    seen_headlines.clear()
+        # DB dedup (cross-worker, survives restarts, catches updated headlines)
+        if was_recently_alerted(headline_key):
+            print(f"NEWS: Skipping duplicate: {title[:50]}")
+            continue
 
-            print(f"NEWS: High-impact detected: {title[:60]}")
+        print(f"NEWS: High-impact detected: {title[:60]}")
 
-            if active_trade:
-                analysis, risk = analyze_news_impact(title, active_trade)
-            else:
-                analysis, risk = analyze_news_opportunity(title)
+        if active_trade:
+            analysis, risk = analyze_news_impact(title, active_trade)
+        else:
+            analysis, risk = analyze_news_opportunity(title)
 
-            if analysis:
-                send_news_alert(title, active_trade, analysis, risk)
-            break  # One alert per poll cycle
+        if analysis:
+            send_news_alert(title, active_trade, analysis, risk)
+        break  # One alert per poll cycle
 
 
 # ===================================================
