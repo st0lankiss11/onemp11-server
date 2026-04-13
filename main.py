@@ -86,6 +86,10 @@ def start_news_thread():
     print(f"NEWS: Poller started (interval={FJ_POLL_INTERVAL}s)")
 
 
+# NOTE: start_news_thread() is called from gunicorn post_fork hook (gunicorn.conf.py)
+# This prevents duplicate pollers from master + worker processes
+
+
 def get_news_context(max_items=5):
     with news_cache_lock:
         items = list(news_cache)
@@ -614,8 +618,10 @@ def get_session_from_time(ts_str):
 
 def store_alert(data):
     session = get_session_from_time(data.get("timestamp", ""))
+    atype = data.get("alert_type", "UNKNOWN")
+    source = data.get("source", "V8_1B")
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = sqlite3.connect(DB_PATH, timeout=10)
         c = conn.cursor()
         c.execute("""
             INSERT INTO alerts (
@@ -644,10 +650,14 @@ def store_alert(data):
             data.get("source", "V8_1B")
         ))
         conn.commit()
+        new_id = c.lastrowid
         conn.close()
+        print(f"DB: Stored {source}/{atype} as id={new_id}")
+        return True
     except Exception as e:
-        print(f"DB ERROR in store_alert: {e}")
+        print(f"DB ERROR storing {source}/{atype}: {e}")
         traceback.print_exc()
+        return False
 
 
 def get_recent_alerts(n=10):
@@ -1451,9 +1461,12 @@ Describe what you see on the chart in 1 sentence, then give your verdict."""}
                 confidence = "LOW"
             clean = text.replace("[HIGH CONFIDENCE]", "").replace("[MEDIUM CONFIDENCE]", "").replace("[LOW CONFIDENCE]", "").strip()
             return clean, confidence
+        else:
+            print(f"CLAUDE: API returned {response.status_code}: {response.text[:300]}")
 
     except Exception as e:
         print(f"Claude API error: {e}")
+        traceback.print_exc()
 
     return "", ""
 
@@ -1735,7 +1748,7 @@ def process_alert_background(raw, source):
         forward_to_discord(alert_data, claude_analysis, claude_confidence)
         print(f"BG: Processed {source}/{alert_data['alert_type']} → {claude_confidence or 'no analysis'}")
     except Exception as e:
-        print(f"BG ERROR: {e}")
+        print(f"BG ERROR processing {source}: {e}")
         traceback.print_exc()
         # Still try to forward raw alert to Discord even if Claude fails
         try:
@@ -1925,7 +1938,8 @@ Be concise, use specific numbers."""
     return jsonify({"stats": stats_data, "sessions": session_data, "summary": "Claude unavailable"})
 
 
-start_news_thread()
+# News thread started via gunicorn.conf.py post_fork hook
 
 if __name__ == "__main__":
+    start_news_thread()
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
