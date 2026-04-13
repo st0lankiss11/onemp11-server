@@ -114,20 +114,87 @@ def get_news_context(max_items=5):
 # AUTONOMOUS NEWS IMPACT ALERTS
 # ===================================================
 HIGH_IMPACT_KEYWORDS = [
-    # Fed / Monetary
+    # ── Fed / Monetary Policy ──
     "fomc", "fed rate", "rate decision", "rate cut", "rate hike", "powell",
     "federal reserve", "quantitative", "tapering", "hawkish", "dovish",
-    # Economic data
+    "fed funds", "monetary policy", "interest rate", "basis points",
+    "fed minutes", "fed meeting", "fed pivot", "rate hold", "rate pause",
+    "waller", "williams", "bostic", "barkin", "kashkari", "goolsbee",
+    "mester", "daly", "logan", "bowman", "jefferson", "cook",
+    "balance sheet", "reverse repo", "rrp", "quantitative tightening",
+    # ── Economic Data Releases ──
     "nfp", "non-farm", "payroll", "cpi", "inflation", "ppi", "gdp",
     "jobless claims", "unemployment", "retail sales", "ism",
-    # Geopolitical
+    "pce", "core pce", "consumer confidence", "consumer sentiment",
+    "michigan sentiment", "durable goods", "housing starts",
+    "building permits", "existing home", "new home sales", "pending home",
+    "industrial production", "capacity utilization", "jolts",
+    "adp employment", "initial claims", "continuing claims",
+    "import price", "export price", "trade balance", "trade deficit",
+    "current account", "productivity", "unit labor cost",
+    "empire state", "philly fed", "chicago pmi", "dallas fed",
+    "richmond fed", "kansas city fed", "beige book",
+    # ── Treasury / Bonds / Yields ──
+    "treasury", "10-year", "10 year", "2-year", "2 year", "30-year",
+    "yield", "bond auction", "bid-to-cover", "inversion", "yield curve",
+    "treasury auction", "bond sell", "bond rally", "sovereign debt",
+    "municipal bond", "corporate bond", "junk bond", "high yield",
+    "credit spread", "swap spread",
+    # ── Geopolitical / Trade War ──
     "tariff", "trade war", "sanction", "invasion", "war ", "missile",
-    "nato", "china retaliate", "escalat", "nuclear",
-    # Market events
+    "nato", "china retaliate", "escalat", "nuclear", "ceasefire",
+    "embargo", "blockade", "military", "troops", "strike ",
+    "retaliat", "counter-tariff", "countermeasure", "trade deal",
+    "trade agreement", "trade tension", "export control", "chip ban",
+    "huawei", "semiconductor ban", "rare earth", "supply chain",
+    # ── Trump / US Politics ──
+    "trump", "executive order", "truth social", "government shutdown",
+    "debt ceiling", "debt limit", "congress", "white house",
+    "impeach", "indictment", "election", "biden", "republican",
+    "democrat", "legislation", "fiscal policy", "spending bill",
+    "continuing resolution",
+    # ── China / Asia ──
+    "china", "beijing", "xi jinping", "pboc", "yuan", "devalue",
+    "renminbi", "china gdp", "china pmi", "caixin", "shanghai",
+    "hang seng", "nikkei", "boj", "bank of japan", "yen",
+    "south china sea", "taiwan", "chips act",
+    # ── Oil / Energy / Commodities ──
+    "crude oil", "wti", "brent", "opec", "oil price", "oil surge",
+    "oil crash", "energy crisis", "natural gas", "gasoline",
+    "petroleum", "oil inventory", "eia", "drilling rig",
+    "oil production", "oil cut", "opec+", "saudi", "gold surge",
+    "gold crash", "copper", "commodity",
+    # ── Currencies / Dollar ──
+    "dollar index", "dxy", "euro", "eur/usd", "gbp", "sterling",
+    "forex", "currency", "fx ", "dollar surge", "dollar crash",
+    "strong dollar", "weak dollar", "dollar selloff",
+    # ── Market Events / Crashes ──
     "circuit breaker", "halt", "flash crash", "margin call", "liquidat",
     "bank failure", "default", "downgrade", "credit rating",
-    # ES specific
+    "black swan", "volatility spike", "vix spike", "vix surge",
+    "sell-off", "selloff", "capitulat", "panic", "crash",
+    "correction", "bear market", "recession", "stagflation",
+    "bank run", "contagion", "systemic risk", "too big to fail",
+    # ── Earnings / Big Tech (ES movers) ──
+    "earnings", "earnings miss", "earnings beat", "revenue miss",
+    "guidance cut", "guidance raise", "profit warning",
+    "nvidia", "apple", "microsoft", "amazon", "google", "alphabet",
+    "meta", "tesla", "magnificent seven", "mag 7", "big tech",
+    "ai chip", "semiconductor", "chip stock",
+    # ── Central Banks (non-Fed) ──
+    "ecb", "european central bank", "lagarde", "bank of england",
+    "boe", "rba", "reserve bank", "snb", "swiss national",
+    # ── ES / Equity Index Specific ──
     "s&p 500", "s&p500", "es futures", "spx", "equity futures",
+    "nasdaq", "dow jones", "russell", "futures surge", "futures drop",
+    "futures plunge", "pre-market", "after-hours",
+    "market open", "market close", "triple witch", "quad witch",
+    "opex", "options expir", "gamma", "0dte",
+    # ── Crypto Spillover (risk sentiment) ──
+    "bitcoin crash", "crypto crash", "tether", "stablecoin",
+    "bitcoin surge", "crypto rally",
+    # ── Natural Disasters (USGS enabled) ──
+    "earthquake", "tsunami", "hurricane", "typhoon", "wildfire",
 ]
 
 seen_headlines = set()
@@ -1404,9 +1471,6 @@ CONFLUENCE SCORING (only for V8.1b entry/reversal alerts):
         # generic placeholder for unlisted charts, not actual chart screenshot.
         # TODO: Re-enable when headless browser screenshots are available.
         chart_image = None
-        # vision_types = ["ENTRY", "RE_ENTRY", "REVERSAL", "MILESTONE_UP", "MILESTONE_DOWN", "ADR_R100", "ADR_R125", "ADR_S100", "ADR_S125"]
-        # if alert_data.get("alert_type", "") in vision_types:
-        #     chart_image = fetch_chart_image()
 
         # Build messages — with or without Vision
         if chart_image:
