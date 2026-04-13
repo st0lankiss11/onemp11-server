@@ -396,7 +396,7 @@ Keep it to 2-3 sentences. End with one of:
     return "", ""
 
 
-def send_news_alert(headline, active_trade, analysis, risk_level):
+def send_news_alert(headline, active_trade, analysis, risk_level, skip_store=False):
     """Send news alert to Discord — works for both in-trade and flat"""
     if not DISCORD_WEBHOOK_URL:
         return
@@ -449,11 +449,67 @@ def send_news_alert(headline, active_trade, analysis, risk_level):
         "claude_analysis": analysis,
         "claude_confidence": risk_level,
         "timestamp": datetime.utcnow().isoformat(),
-    })
+    }) if not skip_store else None
+
+
+def claim_headline_in_db(headline):
+    """Write a placeholder NEWS_IMPACT row BEFORE Claude API call.
+    This prevents other workers/threads from processing the same headline
+    during the 15-30 sec Claude API wait."""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        c = conn.cursor()
+        c.execute("""
+            INSERT INTO alerts (timestamp, alert_type, direction, price, verdict,
+                                claude_analysis, claude_confidence, source)
+            VALUES (?, 'NEWS_IMPACT', 'FLAT', 0, ?, 'PENDING', 'PENDING', 'V8_1B')
+        """, (datetime.utcnow().isoformat(), headline[:200]))
+        claim_id = c.lastrowid
+        conn.commit()
+        conn.close()
+        print(f"NEWS: Claimed headline id={claim_id}: {headline[:50]}")
+        return claim_id
+    except Exception as e:
+        print(f"NEWS: Claim error: {e}")
+        return None
+
+
+def update_claimed_headline(claim_id, active_trade, analysis, risk_level):
+    """Update the placeholder row with actual Claude analysis"""
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=10)
+        c = conn.cursor()
+        c.execute("""
+            UPDATE alerts SET
+                direction = ?, price = ?,
+                claude_analysis = ?, claude_confidence = ?
+            WHERE id = ?
+        """, (
+            active_trade["direction"] if active_trade else "FLAT",
+            active_trade["price"] if active_trade else 0,
+            analysis, risk_level, claim_id
+        ))
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        print(f"NEWS: Update claim error: {e}")
 
 
 def check_news_impact():
-    """Check new headlines for high-impact events, alert whether in trade or not"""
+    """Check new headlines for high-impact events, alert whether in trade or not.
+    Uses threading lock + DB claim to prevent duplicate alerts across workers/threads."""
+
+    # Lock prevents concurrent processing within the same worker
+    if not _news_alert_lock.acquire(blocking=False):
+        return  # Another thread is already processing news
+    try:
+        _check_news_impact_locked()
+    finally:
+        _news_alert_lock.release()
+
+
+def _check_news_impact_locked():
+    """Inner function — always called under _news_alert_lock"""
     with news_cache_lock:
         items = list(news_cache)
 
@@ -492,9 +548,12 @@ def check_news_impact():
         print(f"NEWS: High-impact detected: {title[:60]}")
 
         # Set cooldown IMMEDIATELY — before Claude API call (15-30 sec)
-        # This prevents the next poll cycle from processing the same or another headline
         global _last_news_alert_time
         _last_news_alert_time = time.time()
+
+        # DB CLAIM — write placeholder row so other workers see it instantly
+        # This closes the race window where Claude API takes 15-30 sec
+        claim_id = claim_headline_in_db(title)
 
         if active_trade:
             analysis, risk = analyze_news_impact(title, active_trade)
@@ -502,7 +561,16 @@ def check_news_impact():
             analysis, risk = analyze_news_opportunity(title)
 
         if analysis:
-            send_news_alert(title, active_trade, analysis, risk)
+            # Update the claim with actual analysis
+            if claim_id:
+                update_claimed_headline(claim_id, active_trade, analysis, risk)
+            send_news_alert(title, active_trade, analysis, risk, skip_store=True)
+        elif claim_id:
+            # Claude returned nothing — delete the claim
+            try:
+                delete_alert(claim_id)
+            except Exception:
+                pass
         break  # One alert per poll cycle
 
 
