@@ -1400,11 +1400,13 @@ CONFLUENCE SCORING (only for V8.1b entry/reversal alerts):
 - No other signals recently = judge on V8.1b signal alone using database history"""
 
     try:
-        # Fetch chart image for V8.1b actionable alerts
+        # Chart Vision temporarily disabled — TradingView og:image returns
+        # generic placeholder for unlisted charts, not actual chart screenshot.
+        # TODO: Re-enable when headless browser screenshots are available.
         chart_image = None
-        vision_types = ["ENTRY", "RE_ENTRY", "REVERSAL", "MILESTONE_UP", "MILESTONE_DOWN", "ADR_R100", "ADR_R125", "ADR_S100", "ADR_S125"]
-        if alert_data.get("alert_type", "") in vision_types:
-            chart_image = fetch_chart_image()
+        # vision_types = ["ENTRY", "RE_ENTRY", "REVERSAL", "MILESTONE_UP", "MILESTONE_DOWN", "ADR_R100", "ADR_R125", "ADR_S100", "ADR_S125"]
+        # if alert_data.get("alert_type", "") in vision_types:
+        #     chart_image = fetch_chart_image()
 
         # Build messages — with or without Vision
         if chart_image:
