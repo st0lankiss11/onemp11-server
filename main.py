@@ -133,6 +133,8 @@ HIGH_IMPACT_KEYWORDS = [
 seen_headlines = set()
 seen_headlines_lock = threading.Lock()
 NEWS_COOLDOWN_MINUTES = 5  # Min time between news alerts
+_last_news_alert_time = 0  # In-memory cooldown (instant, no DB delay)
+_news_alert_lock = threading.Lock()  # Prevent concurrent news processing
 
 
 def get_headline_key(headline):
@@ -168,6 +170,10 @@ def was_recently_alerted(headline_key):
 
 def news_on_cooldown():
     """Check if any news alert was sent within cooldown period"""
+    global _last_news_alert_time
+    # In-memory check first (instant, catches the gap while Claude API runs)
+    if time.time() - _last_news_alert_time < NEWS_COOLDOWN_MINUTES * 60:
+        return True
     try:
         conn = sqlite3.connect(DB_PATH)
         c = conn.cursor()
@@ -417,6 +423,11 @@ def check_news_impact():
             continue
 
         print(f"NEWS: High-impact detected: {title[:60]}")
+
+        # Set cooldown IMMEDIATELY — before Claude API call (15-30 sec)
+        # This prevents the next poll cycle from processing the same or another headline
+        global _last_news_alert_time
+        _last_news_alert_time = time.time()
 
         if active_trade:
             analysis, risk = analyze_news_impact(title, active_trade)
