@@ -396,7 +396,7 @@ Keep it to 2-3 sentences. End with one of:
     return "", ""
 
 
-def send_news_alert(headline, active_trade, analysis, risk_level, skip_store=False):
+def send_news_alert(headline, active_trade, analysis, risk_level):
     """Send news alert to Discord — works for both in-trade and flat"""
     if not DISCORD_WEBHOOK_URL:
         return
@@ -449,50 +449,7 @@ def send_news_alert(headline, active_trade, analysis, risk_level, skip_store=Fal
         "claude_analysis": analysis,
         "claude_confidence": risk_level,
         "timestamp": datetime.utcnow().isoformat(),
-    }) if not skip_store else None
-
-
-def claim_headline_in_db(headline):
-    """Write a placeholder NEWS_IMPACT row BEFORE Claude API call.
-    This prevents other workers/threads from processing the same headline
-    during the 15-30 sec Claude API wait."""
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=10)
-        c = conn.cursor()
-        c.execute("""
-            INSERT INTO alerts (timestamp, alert_type, direction, price, verdict,
-                                claude_analysis, claude_confidence, source)
-            VALUES (?, 'NEWS_IMPACT', 'FLAT', 0, ?, 'PENDING', 'PENDING', 'V8_1B')
-        """, (datetime.utcnow().isoformat(), headline[:200]))
-        claim_id = c.lastrowid
-        conn.commit()
-        conn.close()
-        print(f"NEWS: Claimed headline id={claim_id}: {headline[:50]}")
-        return claim_id
-    except Exception as e:
-        print(f"NEWS: Claim error: {e}")
-        return None
-
-
-def update_claimed_headline(claim_id, active_trade, analysis, risk_level):
-    """Update the placeholder row with actual Claude analysis"""
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=10)
-        c = conn.cursor()
-        c.execute("""
-            UPDATE alerts SET
-                direction = ?, price = ?,
-                claude_analysis = ?, claude_confidence = ?
-            WHERE id = ?
-        """, (
-            active_trade["direction"] if active_trade else "FLAT",
-            active_trade["price"] if active_trade else 0,
-            analysis, risk_level, claim_id
-        ))
-        conn.commit()
-        conn.close()
-    except Exception as e:
-        print(f"NEWS: Update claim error: {e}")
+    })
 
 
 def check_news_impact():
@@ -520,6 +477,17 @@ def _check_news_impact_locked():
     if news_on_cooldown():
         return
 
+    # Cleanup old dedup entries (> 1 hour) to prevent table bloat
+    try:
+        conn = sqlite3.connect(DB_PATH, timeout=5)
+        c = conn.cursor()
+        cutoff = (datetime.utcnow() - timedelta(hours=1)).isoformat()
+        c.execute("DELETE FROM news_sent WHERE timestamp < ?", (cutoff,))
+        conn.commit()
+        conn.close()
+    except Exception:
+        pass
+
     active_trade = get_active_trade()
 
     for item in items[:5]:
@@ -532,17 +500,25 @@ def _check_news_impact_locked():
 
         headline_key = get_headline_key(title)
 
-        # In-memory dedup (same worker, same session)
-        with seen_headlines_lock:
-            if headline_key in seen_headlines:
-                continue
-            seen_headlines.add(headline_key)
-            if len(seen_headlines) > 500:
-                seen_headlines.clear()
+        # ATOMIC DEDUP — INSERT OR IGNORE with UNIQUE constraint
+        # If another worker/thread already claimed this headline, rowcount = 0
+        # This is the ONLY dedup check needed — no race conditions possible
+        try:
+            conn = sqlite3.connect(DB_PATH, timeout=10)
+            c = conn.cursor()
+            c.execute("""
+                INSERT OR IGNORE INTO news_sent (headline_key, headline, timestamp)
+                VALUES (?, ?, ?)
+            """, (headline_key, title[:200], datetime.utcnow().isoformat()))
+            claimed = c.rowcount > 0  # 1 = we claimed it, 0 = already exists
+            conn.commit()
+            conn.close()
+        except Exception as e:
+            print(f"NEWS: Dedup DB error: {e}")
+            continue
 
-        # DB dedup (cross-worker, survives restarts, catches updated headlines)
-        if was_recently_alerted(headline_key):
-            print(f"NEWS: Skipping duplicate: {title[:50]}")
+        if not claimed:
+            print(f"NEWS: Already claimed: {title[:50]}")
             continue
 
         print(f"NEWS: High-impact detected: {title[:60]}")
@@ -551,26 +527,13 @@ def _check_news_impact_locked():
         global _last_news_alert_time
         _last_news_alert_time = time.time()
 
-        # DB CLAIM — write placeholder row so other workers see it instantly
-        # This closes the race window where Claude API takes 15-30 sec
-        claim_id = claim_headline_in_db(title)
-
         if active_trade:
             analysis, risk = analyze_news_impact(title, active_trade)
         else:
             analysis, risk = analyze_news_opportunity(title)
 
         if analysis:
-            # Update the claim with actual analysis
-            if claim_id:
-                update_claimed_headline(claim_id, active_trade, analysis, risk)
-            send_news_alert(title, active_trade, analysis, risk, skip_store=True)
-        elif claim_id:
-            # Claude returned nothing — delete the claim
-            try:
-                delete_alert(claim_id)
-            except Exception:
-                pass
+            send_news_alert(title, active_trade, analysis, risk)
         break  # One alert per poll cycle
 
 
@@ -731,6 +694,23 @@ def init_db():
             except sqlite3.OperationalError:
                 pass
         conn.commit()
+
+        # Atomic news dedup table — UNIQUE constraint prevents duplicate alerts
+        conn2 = sqlite3.connect(DB_PATH)
+        c2 = conn2.cursor()
+        c2.execute("""
+            CREATE TABLE IF NOT EXISTS news_sent (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                headline_key TEXT UNIQUE,
+                headline TEXT,
+                timestamp TEXT
+            )
+        """)
+        conn2.commit()
+        conn2.close()
+
+        conn = sqlite3.connect(DB_PATH)
+        c = conn.cursor()
         conn.close()
         print(f"DB: Initialized at {DB_PATH}")
 
