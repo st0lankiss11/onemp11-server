@@ -274,7 +274,7 @@ def get_active_trade():
         # Check if there's a more recent exit
         c.execute("""
             SELECT alert_type FROM alerts
-            WHERE alert_type IN ('SESSION_CLOSE', 'FRIDAY_CLOSE', 'REVERSAL')
+            WHERE alert_type IN ('SESSION_CLOSE', 'FRIDAY_CLOSE', 'REVERSAL', 'BANK_EXIT', 'REVERSAL_EXIT')
             AND id > (SELECT MAX(id) FROM alerts WHERE alert_type IN ('ENTRY', 'RE_ENTRY'))
             ORDER BY id DESC LIMIT 1
         """)
@@ -596,6 +596,7 @@ TL SPREAD (ATR-based):
 
 SESSION FILTER:
 - No-entry zone: 2pm-5pm CT (blocks entries + re-entries, NOT reversals)
+- Reversals ALWAYS fire regardless of no-entry zone (V8.1c fix)
 - Force close: 4pm CT Mon-Thu (always ON)
 - Friday auto-close: 4pm (market closed Fri 4pm - Sun 5pm)
 - Session open: 5pm CT (ES futures reopen)
@@ -604,6 +605,10 @@ ALERT TYPES:
 - ENTRY: Fresh long/short — all 4 conditions aligned (strongest signal)
 - RE_ENTRY: Momentum flipped back to trend after pullback
 - REVERSAL: All conditions flipped — exits current AND enters opposite
+- BANK_EXIT: Traffic light = BANK IT while in profit → auto-close, keeps tradeDir alive for re-entry
+- STOP_WARNING: Trade hit hard stop threshold — Claude analyzes and recommends CUT or HOLD
+- CUT_WARNING: Traffic light all red + underwater — Claude analyzes and recommends CUT or HOLD
+- BANK_WARNING: Traffic light all red + in profit — Claude analyzes and recommends BANK or HOLD
 - SESSION_CLOSE / FRIDAY_CLOSE: Force exit at 4pm CT
 - MILESTONE_UP: Trade hit +10, +20, or +30 pts profit
 - MILESTONE_DOWN: Trade hit -15 or -25 pts loss
@@ -1235,6 +1240,9 @@ def parse_alert(raw_json):
             data["alert_type"], data["direction"] = "ENTRY", "LONG"
         elif "GO SHORT" in content and "REVERSAL" not in content:
             data["alert_type"], data["direction"] = "ENTRY", "SHORT"
+        elif "REVERSAL EXIT" in content:
+            data["alert_type"] = "REVERSAL_EXIT"
+            data["direction"] = "LONG" if "Exited LONG" in content else "SHORT"
         elif "REVERSAL" in content:
             data["alert_type"] = "REVERSAL"
             if "GO LONG" in content:
@@ -1243,6 +1251,18 @@ def parse_alert(raw_json):
                 data["direction"] = "SHORT"
             else:
                 data["direction"] = "LONG" if "Exited SHORT" in content else "SHORT"
+        elif "HARD STOP WARNING" in content:
+            data["alert_type"] = "STOP_WARNING"
+            data["direction"] = "LONG" if "LONG" in content else "SHORT"
+        elif "CUT LOSS WARNING" in content:
+            data["alert_type"] = "CUT_WARNING"
+            data["direction"] = "LONG" if "LONG" in content else "SHORT"
+        elif "BANK IT WARNING" in content:
+            data["alert_type"] = "BANK_WARNING"
+            data["direction"] = "LONG" if "LONG" in content else "SHORT"
+        elif "BANK EXIT" in content:
+            data["alert_type"] = "BANK_EXIT"
+            data["direction"] = "LONG" if "Exited LONG" in content else "SHORT"
         elif "FRIDAY CLOSE" in content:
             data["alert_type"] = "FRIDAY_CLOSE"
             data["direction"] = "LONG" if "Exited LONG" in content else "SHORT"
@@ -1508,8 +1528,24 @@ CURRENT ALERT (source: {source}):
 INSTRUCTIONS — Be actionable. The trader needs to make money, not read essays.
 
 ALERT SOURCE MATTERS:
-- V8.1b alerts (ENTRY, RE_ENTRY, REVERSAL, MILESTONE, SESSION_CLOSE) = PRIMARY trading system
+- V8.1b alerts (ENTRY, RE_ENTRY, REVERSAL, MILESTONE, SESSION_CLOSE, BANK_EXIT) = PRIMARY trading system
   → These are the actual trades. Give TAKE IT / SKIP / HOLD / BANK / CUT verdicts.
+  → BANK_EXIT means traffic light went BANK IT while in profit. Trade closed, watching for re-entry.
+  → For BANK_EXIT: confirm the exit was correct, note if re-entry conditions are building.
+- STOP_WARNING / CUT_WARNING / BANK_WARNING = EXIT DECISION ALERTS
+  → The trade is STILL OPEN. The system detected danger and is asking YOU to decide.
+  → You MUST give a clear verdict: "CUT NOW" or "HOLD THROUGH" or "BANK NOW"
+  → For CUT/HOLD decisions, analyze these factors:
+    1. Is the trend structurally intact? (TL slope direction, ADX trending?)
+    2. Is momentum building back or still fading? (CVD Mom direction, candle color)
+    3. How extended is price from TL? (spread ratio — if TIGHT, pullback is normal)
+    4. RSI position — is it at a reversal zone or mid-range?
+    5. How did similar drawdowns resolve? (check DB: trades that hit -15 recovered X%)
+    6. Time of day — is there enough session left for recovery?
+    7. News context — any headlines threatening the position?
+  → Be DECISIVE. The trader needs a clear answer, not a hedge.
+  → If even ONE of these is strongly against → lean CUT
+  → If trend/momentum are intact and it's just a pullback → HOLD THROUGH
 - RSI_PROFILE alerts (TIER1, TIER2, ZONE) = SUPPORTING context
   → These are NOT separate trades. They tell you if RSI Profile agrees with V8.1b direction.
   → If V8.1b has an active LONG and RSI Profile fires LONG → "confluence confirms your trade"
@@ -1626,7 +1662,12 @@ ALERT_STYLES = {
     "SESSION_CLOSE":  {"emoji": "⏸",  "color": 10070709, "label": "4PM CLOSE"},
     "FRIDAY_CLOSE":   {"emoji": "🔒", "color": 10070709, "label": "FRIDAY CLOSE"},
     "REVERSAL":       {"emoji": "🔄", "color": 15844367, "label": "REVERSAL"},
+    "REVERSAL_EXIT":  {"emoji": "🔄", "color": 16750848, "label": "REVERSAL EXIT"},
     "TREND_OVER":     {"emoji": "❌", "color": 9807270,  "label": "TREND OVER"},
+    "BANK_EXIT":      {"emoji": "💰", "color": 16766720, "label": "BANK EXIT"},
+    "STOP_WARNING":   {"emoji": "🛑", "color": 15548997, "label": "HARD STOP WARNING"},
+    "CUT_WARNING":    {"emoji": "✂️", "color": 15548997, "label": "CUT LOSS WARNING"},
+    "BANK_WARNING":   {"emoji": "💰", "color": 16766720, "label": "BANK IT WARNING"},
     "MILESTONE_UP":   {"emoji": "📈", "color": 5763719,  "label": "MILESTONE UP"},
     "MILESTONE_DOWN": {"emoji": "📉", "color": 15548997, "label": "MILESTONE DOWN"},
     "MARKET_CHECK":   {"emoji": "📋", "color": 3447003,  "label": "10am MARKET CHECK"},
@@ -1788,7 +1829,7 @@ def build_discord_payload(alert_data, claude_analysis="", claude_confidence="", 
     description = "\n".join(lines)
 
     # Add chart link for quick access (only for actionable alerts)
-    actionable = ["ENTRY", "RE_ENTRY", "REVERSAL", "MILESTONE_UP", "MILESTONE_DOWN",
+    actionable = ["ENTRY", "RE_ENTRY", "REVERSAL", "MILESTONE_UP", "MILESTONE_DOWN", "BANK_EXIT",
                    "SPY_VIX_ENTRY", "RSI_PROFILE_LONG", "RSI_PROFILE_SHORT"]
     if CHART_URL and atype in actionable:
         description += f"\n\n📊 [Live Chart]({CHART_URL})"
