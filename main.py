@@ -23,6 +23,7 @@ app = Flask(__name__)
 # CONFIG
 # ===================================================
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
+NEWS_DISCORD_WEBHOOK_URL = os.environ.get("NEWS_DISCORD_WEBHOOK_URL", "")  # Separate channel for news
 ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 WEBHOOK_SECRET      = os.environ.get("WEBHOOK_SECRET", "onemp11")
 ENABLE_CLAUDE       = os.environ.get("ENABLE_CLAUDE", "true").lower() == "true"
@@ -114,87 +115,20 @@ def get_news_context(max_items=5):
 # AUTONOMOUS NEWS IMPACT ALERTS
 # ===================================================
 HIGH_IMPACT_KEYWORDS = [
-    # ── Fed / Monetary Policy ──
+    # Fed / Monetary
     "fomc", "fed rate", "rate decision", "rate cut", "rate hike", "powell",
     "federal reserve", "quantitative", "tapering", "hawkish", "dovish",
-    "fed funds", "monetary policy", "interest rate", "basis points",
-    "fed minutes", "fed meeting", "fed pivot", "rate hold", "rate pause",
-    "waller", "williams", "bostic", "barkin", "kashkari", "goolsbee",
-    "mester", "daly", "logan", "bowman", "jefferson", "cook",
-    "balance sheet", "reverse repo", "rrp", "quantitative tightening",
-    # ── Economic Data Releases ──
+    # Economic data
     "nfp", "non-farm", "payroll", "cpi", "inflation", "ppi", "gdp",
     "jobless claims", "unemployment", "retail sales", "ism",
-    "pce", "core pce", "consumer confidence", "consumer sentiment",
-    "michigan sentiment", "durable goods", "housing starts",
-    "building permits", "existing home", "new home sales", "pending home",
-    "industrial production", "capacity utilization", "jolts",
-    "adp employment", "initial claims", "continuing claims",
-    "import price", "export price", "trade balance", "trade deficit",
-    "current account", "productivity", "unit labor cost",
-    "empire state", "philly fed", "chicago pmi", "dallas fed",
-    "richmond fed", "kansas city fed", "beige book",
-    # ── Treasury / Bonds / Yields ──
-    "treasury", "10-year", "10 year", "2-year", "2 year", "30-year",
-    "yield", "bond auction", "bid-to-cover", "inversion", "yield curve",
-    "treasury auction", "bond sell", "bond rally", "sovereign debt",
-    "municipal bond", "corporate bond", "junk bond", "high yield",
-    "credit spread", "swap spread",
-    # ── Geopolitical / Trade War ──
+    # Geopolitical
     "tariff", "trade war", "sanction", "invasion", "war ", "missile",
-    "nato", "china retaliate", "escalat", "nuclear", "ceasefire",
-    "embargo", "blockade", "military", "troops", "strike ",
-    "retaliat", "counter-tariff", "countermeasure", "trade deal",
-    "trade agreement", "trade tension", "export control", "chip ban",
-    "huawei", "semiconductor ban", "rare earth", "supply chain",
-    # ── Trump / US Politics ──
-    "trump", "executive order", "truth social", "government shutdown",
-    "debt ceiling", "debt limit", "congress", "white house",
-    "impeach", "indictment", "election", "biden", "republican",
-    "democrat", "legislation", "fiscal policy", "spending bill",
-    "continuing resolution",
-    # ── China / Asia ──
-    "china", "beijing", "xi jinping", "pboc", "yuan", "devalue",
-    "renminbi", "china gdp", "china pmi", "caixin", "shanghai",
-    "hang seng", "nikkei", "boj", "bank of japan", "yen",
-    "south china sea", "taiwan", "chips act",
-    # ── Oil / Energy / Commodities ──
-    "crude oil", "wti", "brent", "opec", "oil price", "oil surge",
-    "oil crash", "energy crisis", "natural gas", "gasoline",
-    "petroleum", "oil inventory", "eia", "drilling rig",
-    "oil production", "oil cut", "opec+", "saudi", "gold surge",
-    "gold crash", "copper", "commodity",
-    # ── Currencies / Dollar ──
-    "dollar index", "dxy", "euro", "eur/usd", "gbp", "sterling",
-    "forex", "currency", "fx ", "dollar surge", "dollar crash",
-    "strong dollar", "weak dollar", "dollar selloff",
-    # ── Market Events / Crashes ──
+    "nato", "china retaliate", "escalat", "nuclear",
+    # Market events
     "circuit breaker", "halt", "flash crash", "margin call", "liquidat",
     "bank failure", "default", "downgrade", "credit rating",
-    "black swan", "volatility spike", "vix spike", "vix surge",
-    "sell-off", "selloff", "capitulat", "panic", "crash",
-    "correction", "bear market", "recession", "stagflation",
-    "bank run", "contagion", "systemic risk", "too big to fail",
-    # ── Earnings / Big Tech (ES movers) ──
-    "earnings", "earnings miss", "earnings beat", "revenue miss",
-    "guidance cut", "guidance raise", "profit warning",
-    "nvidia", "apple", "microsoft", "amazon", "google", "alphabet",
-    "meta", "tesla", "magnificent seven", "mag 7", "big tech",
-    "ai chip", "semiconductor", "chip stock",
-    # ── Central Banks (non-Fed) ──
-    "ecb", "european central bank", "lagarde", "bank of england",
-    "boe", "rba", "reserve bank", "snb", "swiss national",
-    # ── ES / Equity Index Specific ──
+    # ES specific
     "s&p 500", "s&p500", "es futures", "spx", "equity futures",
-    "nasdaq", "dow jones", "russell", "futures surge", "futures drop",
-    "futures plunge", "pre-market", "after-hours",
-    "market open", "market close", "triple witch", "quad witch",
-    "opex", "options expir", "gamma", "0dte",
-    # ── Crypto Spillover (risk sentiment) ──
-    "bitcoin crash", "crypto crash", "tether", "stablecoin",
-    "bitcoin surge", "crypto rally",
-    # ── Natural Disasters (USGS enabled) ──
-    "earthquake", "tsunami", "hurricane", "typhoon", "wildfire",
 ]
 
 seen_headlines = set()
@@ -274,7 +208,7 @@ def get_active_trade():
         # Check if there's a more recent exit
         c.execute("""
             SELECT alert_type FROM alerts
-            WHERE alert_type IN ('SESSION_CLOSE', 'FRIDAY_CLOSE', 'REVERSAL', 'BANK_EXIT', 'REVERSAL_EXIT')
+            WHERE alert_type IN ('SESSION_CLOSE', 'FRIDAY_CLOSE', 'REVERSAL')
             AND id > (SELECT MAX(id) FROM alerts WHERE alert_type IN ('ENTRY', 'RE_ENTRY'))
             ORDER BY id DESC LIMIT 1
         """)
@@ -340,7 +274,7 @@ Keep it to 2-3 sentences. End with one of:
         response = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-6", "max_tokens": 200, "messages": [{"role": "user", "content": prompt}]},
+            json={"model": "claude-sonnet-4-20250514", "max_tokens": 200, "messages": [{"role": "user", "content": prompt}]},
             timeout=30
         )
         if response.status_code == 200:
@@ -381,7 +315,7 @@ Keep it to 2-3 sentences. End with one of:
         response = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-6", "max_tokens": 200, "messages": [{"role": "user", "content": prompt}]},
+            json={"model": "claude-sonnet-4-20250514", "max_tokens": 200, "messages": [{"role": "user", "content": prompt}]},
             timeout=30
         )
         if response.status_code == 200:
@@ -397,8 +331,9 @@ Keep it to 2-3 sentences. End with one of:
 
 
 def send_news_alert(headline, active_trade, analysis, risk_level):
-    """Send news alert to Discord — works for both in-trade and flat"""
-    if not DISCORD_WEBHOOK_URL:
+    """Send news alert to Discord — uses NEWS channel if configured, else main channel"""
+    news_webhook = NEWS_DISCORD_WEBHOOK_URL or DISCORD_WEBHOOK_URL
+    if not news_webhook:
         return
 
     risk_config = {
@@ -436,7 +371,7 @@ def send_news_alert(headline, active_trade, analysis, risk_level):
     }
 
     try:
-        requests.post(DISCORD_WEBHOOK_URL, json={"embeds": [embed], "username": "OneMP11"}, timeout=10)
+        requests.post(news_webhook, json={"embeds": [embed], "username": "OneMP11"}, timeout=10)
         print(f"NEWS: Sent {risk_level} alert for: {headline[:60]}")
     except Exception as e:
         print(f"NEWS: Discord error: {e}")
@@ -453,20 +388,7 @@ def send_news_alert(headline, active_trade, analysis, risk_level):
 
 
 def check_news_impact():
-    """Check new headlines for high-impact events, alert whether in trade or not.
-    Uses threading lock + DB claim to prevent duplicate alerts across workers/threads."""
-
-    # Lock prevents concurrent processing within the same worker
-    if not _news_alert_lock.acquire(blocking=False):
-        return  # Another thread is already processing news
-    try:
-        _check_news_impact_locked()
-    finally:
-        _news_alert_lock.release()
-
-
-def _check_news_impact_locked():
-    """Inner function — always called under _news_alert_lock"""
+    """Check new headlines for high-impact events, alert whether in trade or not"""
     with news_cache_lock:
         items = list(news_cache)
 
@@ -476,17 +398,6 @@ def _check_news_impact_locked():
     # Cooldown: max 1 news alert per N minutes
     if news_on_cooldown():
         return
-
-    # Cleanup old dedup entries (> 1 hour) to prevent table bloat
-    try:
-        conn = sqlite3.connect(DB_PATH, timeout=5)
-        c = conn.cursor()
-        cutoff = (datetime.utcnow() - timedelta(hours=1)).isoformat()
-        c.execute("DELETE FROM news_sent WHERE timestamp < ?", (cutoff,))
-        conn.commit()
-        conn.close()
-    except Exception:
-        pass
 
     active_trade = get_active_trade()
 
@@ -500,30 +411,23 @@ def _check_news_impact_locked():
 
         headline_key = get_headline_key(title)
 
-        # ATOMIC DEDUP — INSERT OR IGNORE with UNIQUE constraint
-        # If another worker/thread already claimed this headline, rowcount = 0
-        # This is the ONLY dedup check needed — no race conditions possible
-        try:
-            conn = sqlite3.connect(DB_PATH, timeout=10)
-            c = conn.cursor()
-            c.execute("""
-                INSERT OR IGNORE INTO news_sent (headline_key, headline, timestamp)
-                VALUES (?, ?, ?)
-            """, (headline_key, title[:200], datetime.utcnow().isoformat()))
-            claimed = c.rowcount > 0  # 1 = we claimed it, 0 = already exists
-            conn.commit()
-            conn.close()
-        except Exception as e:
-            print(f"NEWS: Dedup DB error: {e}")
-            continue
+        # In-memory dedup (same worker, same session)
+        with seen_headlines_lock:
+            if headline_key in seen_headlines:
+                continue
+            seen_headlines.add(headline_key)
+            if len(seen_headlines) > 500:
+                seen_headlines.clear()
 
-        if not claimed:
-            print(f"NEWS: Already claimed: {title[:50]}")
+        # DB dedup (cross-worker, survives restarts, catches updated headlines)
+        if was_recently_alerted(headline_key):
+            print(f"NEWS: Skipping duplicate: {title[:50]}")
             continue
 
         print(f"NEWS: High-impact detected: {title[:60]}")
 
         # Set cooldown IMMEDIATELY — before Claude API call (15-30 sec)
+        # This prevents the next poll cycle from processing the same or another headline
         global _last_news_alert_time
         _last_news_alert_time = time.time()
 
@@ -559,7 +463,6 @@ TL SPREAD (ATR-based):
 
 SESSION FILTER:
 - No-entry zone: 2pm-5pm CT (blocks entries + re-entries, NOT reversals)
-- Reversals ALWAYS fire regardless of no-entry zone (V8.1c fix)
 - Force close: 4pm CT Mon-Thu (always ON)
 - Friday auto-close: 4pm (market closed Fri 4pm - Sun 5pm)
 - Session open: 5pm CT (ES futures reopen)
@@ -568,10 +471,6 @@ ALERT TYPES:
 - ENTRY: Fresh long/short — all 4 conditions aligned (strongest signal)
 - RE_ENTRY: Momentum flipped back to trend after pullback
 - REVERSAL: All conditions flipped — exits current AND enters opposite
-- BANK_EXIT: Traffic light = BANK IT while in profit → auto-close, keeps tradeDir alive for re-entry
-- STOP_WARNING: Trade hit hard stop threshold — Claude analyzes and recommends CUT or HOLD
-- CUT_WARNING: Traffic light all red + underwater — Claude analyzes and recommends CUT or HOLD
-- BANK_WARNING: Traffic light all red + in profit — Claude analyzes and recommends BANK or HOLD
 - SESSION_CLOSE / FRIDAY_CLOSE: Force exit at 4pm CT
 - MILESTONE_UP: Trade hit +10, +20, or +30 pts profit
 - MILESTONE_DOWN: Trade hit -15 or -25 pts loss
@@ -694,23 +593,6 @@ def init_db():
             except sqlite3.OperationalError:
                 pass
         conn.commit()
-
-        # Atomic news dedup table — UNIQUE constraint prevents duplicate alerts
-        conn2 = sqlite3.connect(DB_PATH)
-        c2 = conn2.cursor()
-        c2.execute("""
-            CREATE TABLE IF NOT EXISTS news_sent (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                headline_key TEXT UNIQUE,
-                headline TEXT,
-                timestamp TEXT
-            )
-        """)
-        conn2.commit()
-        conn2.close()
-
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
         conn.close()
         print(f"DB: Initialized at {DB_PATH}")
 
@@ -1220,9 +1102,6 @@ def parse_alert(raw_json):
             data["alert_type"], data["direction"] = "ENTRY", "LONG"
         elif "GO SHORT" in content and "REVERSAL" not in content:
             data["alert_type"], data["direction"] = "ENTRY", "SHORT"
-        elif "REVERSAL EXIT" in content:
-            data["alert_type"] = "REVERSAL_EXIT"
-            data["direction"] = "LONG" if "Exited LONG" in content else "SHORT"
         elif "REVERSAL" in content:
             data["alert_type"] = "REVERSAL"
             if "GO LONG" in content:
@@ -1231,18 +1110,6 @@ def parse_alert(raw_json):
                 data["direction"] = "SHORT"
             else:
                 data["direction"] = "LONG" if "Exited SHORT" in content else "SHORT"
-        elif "HARD STOP WARNING" in content:
-            data["alert_type"] = "STOP_WARNING"
-            data["direction"] = "LONG" if "LONG" in content else "SHORT"
-        elif "CUT LOSS WARNING" in content:
-            data["alert_type"] = "CUT_WARNING"
-            data["direction"] = "LONG" if "LONG" in content else "SHORT"
-        elif "BANK IT WARNING" in content:
-            data["alert_type"] = "BANK_WARNING"
-            data["direction"] = "LONG" if "LONG" in content else "SHORT"
-        elif "BANK EXIT" in content:
-            data["alert_type"] = "BANK_EXIT"
-            data["direction"] = "LONG" if "Exited LONG" in content else "SHORT"
         elif "FRIDAY CLOSE" in content:
             data["alert_type"] = "FRIDAY_CLOSE"
             data["direction"] = "LONG" if "Exited LONG" in content else "SHORT"
@@ -1508,24 +1375,8 @@ CURRENT ALERT (source: {source}):
 INSTRUCTIONS — Be actionable. The trader needs to make money, not read essays.
 
 ALERT SOURCE MATTERS:
-- V8.1b alerts (ENTRY, RE_ENTRY, REVERSAL, MILESTONE, SESSION_CLOSE, BANK_EXIT) = PRIMARY trading system
+- V8.1b alerts (ENTRY, RE_ENTRY, REVERSAL, MILESTONE, SESSION_CLOSE) = PRIMARY trading system
   → These are the actual trades. Give TAKE IT / SKIP / HOLD / BANK / CUT verdicts.
-  → BANK_EXIT means traffic light went BANK IT while in profit. Trade closed, watching for re-entry.
-  → For BANK_EXIT: confirm the exit was correct, note if re-entry conditions are building.
-- STOP_WARNING / CUT_WARNING / BANK_WARNING = EXIT DECISION ALERTS
-  → The trade is STILL OPEN. The system detected danger and is asking YOU to decide.
-  → You MUST give a clear verdict: "CUT NOW" or "HOLD THROUGH" or "BANK NOW"
-  → For CUT/HOLD decisions, analyze these factors:
-    1. Is the trend structurally intact? (TL slope direction, ADX trending?)
-    2. Is momentum building back or still fading? (CVD Mom direction, candle color)
-    3. How extended is price from TL? (spread ratio — if TIGHT, pullback is normal)
-    4. RSI position — is it at a reversal zone or mid-range?
-    5. How did similar drawdowns resolve? (check DB: trades that hit -15 recovered X%)
-    6. Time of day — is there enough session left for recovery?
-    7. News context — any headlines threatening the position?
-  → Be DECISIVE. The trader needs a clear answer, not a hedge.
-  → If even ONE of these is strongly against → lean CUT
-  → If trend/momentum are intact and it's just a pullback → HOLD THROUGH
 - RSI_PROFILE alerts (TIER1, TIER2, ZONE) = SUPPORTING context
   → These are NOT separate trades. They tell you if RSI Profile agrees with V8.1b direction.
   → If V8.1b has an active LONG and RSI Profile fires LONG → "confluence confirms your trade"
@@ -1555,6 +1406,9 @@ CONFLUENCE SCORING (only for V8.1b entry/reversal alerts):
         # generic placeholder for unlisted charts, not actual chart screenshot.
         # TODO: Re-enable when headless browser screenshots are available.
         chart_image = None
+        # vision_types = ["ENTRY", "RE_ENTRY", "REVERSAL", "MILESTONE_UP", "MILESTONE_DOWN", "ADR_R100", "ADR_R125", "ADR_S100", "ADR_S125"]
+        # if alert_data.get("alert_type", "") in vision_types:
+        #     chart_image = fetch_chart_image()
 
         # Build messages — with or without Vision
         if chart_image:
@@ -1605,7 +1459,7 @@ Describe what you see on the chart in 1 sentence, then give your verdict."""}
                 "content-type": "application/json"
             },
             json={
-                "model": "claude-sonnet-4-6",
+                "model": "claude-sonnet-4-20250514",
                 "max_tokens": 300,
                 "messages": messages
             },
@@ -1642,12 +1496,7 @@ ALERT_STYLES = {
     "SESSION_CLOSE":  {"emoji": "⏸",  "color": 10070709, "label": "4PM CLOSE"},
     "FRIDAY_CLOSE":   {"emoji": "🔒", "color": 10070709, "label": "FRIDAY CLOSE"},
     "REVERSAL":       {"emoji": "🔄", "color": 15844367, "label": "REVERSAL"},
-    "REVERSAL_EXIT":  {"emoji": "🔄", "color": 16750848, "label": "REVERSAL EXIT"},
     "TREND_OVER":     {"emoji": "❌", "color": 9807270,  "label": "TREND OVER"},
-    "BANK_EXIT":      {"emoji": "💰", "color": 16766720, "label": "BANK EXIT"},
-    "STOP_WARNING":   {"emoji": "🛑", "color": 15548997, "label": "HARD STOP WARNING"},
-    "CUT_WARNING":    {"emoji": "✂️", "color": 15548997, "label": "CUT LOSS WARNING"},
-    "BANK_WARNING":   {"emoji": "💰", "color": 16766720, "label": "BANK IT WARNING"},
     "MILESTONE_UP":   {"emoji": "📈", "color": 5763719,  "label": "MILESTONE UP"},
     "MILESTONE_DOWN": {"emoji": "📉", "color": 15548997, "label": "MILESTONE DOWN"},
     "MARKET_CHECK":   {"emoji": "📋", "color": 3447003,  "label": "10am MARKET CHECK"},
@@ -1809,7 +1658,7 @@ def build_discord_payload(alert_data, claude_analysis="", claude_confidence="", 
     description = "\n".join(lines)
 
     # Add chart link for quick access (only for actionable alerts)
-    actionable = ["ENTRY", "RE_ENTRY", "REVERSAL", "MILESTONE_UP", "MILESTONE_DOWN", "BANK_EXIT",
+    actionable = ["ENTRY", "RE_ENTRY", "REVERSAL", "MILESTONE_UP", "MILESTONE_DOWN",
                    "SPY_VIX_ENTRY", "RSI_PROFILE_LONG", "RSI_PROFILE_SHORT"]
     if CHART_URL and atype in actionable:
         description += f"\n\n📊 [Live Chart]({CHART_URL})"
@@ -2093,7 +1942,7 @@ Be concise, use specific numbers."""
             response = requests.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={"model": "claude-sonnet-4-6", "max_tokens": 600, "messages": [{"role": "user", "content": prompt}]},
+                json={"model": "claude-sonnet-4-20250514", "max_tokens": 600, "messages": [{"role": "user", "content": prompt}]},
                 timeout=30
             )
             if response.status_code == 200:
