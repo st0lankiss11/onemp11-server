@@ -24,6 +24,8 @@ app = Flask(__name__)
 # ===================================================
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
 NEWS_DISCORD_WEBHOOK_URL = os.environ.get("NEWS_DISCORD_WEBHOOK_URL", "")  # Separate channel for news
+print(f"CONFIG: Main webhook: {'SET' if DISCORD_WEBHOOK_URL else 'NOT SET'}")
+print(f"CONFIG: News webhook: {'SET' if NEWS_DISCORD_WEBHOOK_URL else 'NOT SET (using main channel)'}")
 ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 WEBHOOK_SECRET      = os.environ.get("WEBHOOK_SECRET", "onemp11")
 ENABLE_CLAUDE       = os.environ.get("ENABLE_CLAUDE", "true").lower() == "true"
@@ -244,102 +246,66 @@ def is_high_impact(headline):
 
 
 def analyze_news_impact(headline, active_trade):
-    """Breaking news + active trade → assess risk to position"""
+    """Analyze news impact on ES futures — pure market analysis, no position context"""
     if not ANTHROPIC_API_KEY or not ENABLE_CLAUDE:
         return "", ""
 
-    prompt = f"""{SYSTEM_KNOWLEDGE}
+    prompt = f"""You are an ES futures (S&P 500 E-mini) market analyst. Analyze this breaking news headline.
 
-BREAKING NEWS DETECTED:
-  Headline: {headline}
+HEADLINE: {headline}
 
-ACTIVE TRADE:
-  Direction: {active_trade['direction']}
-  Entry Price: {active_trade['price']}
-  TL State: {active_trade['tl_state']}
-  RSI at entry: {active_trade['rsi']}
-  ADX at entry: {active_trade['adx']}
+Provide analysis covering:
+1. DIRECTION: Is this BULLISH, BEARISH, or NEUTRAL for ES? Be specific about why.
+2. MAGNITUDE: Expected ES move — small (2-5 pts), moderate (5-15 pts), or large (20+ pts)?
+3. TIMING: Immediate reaction (minutes) or develops over hours/days?
+4. MACRO CONTEXT: How does this connect to current themes — Fed policy, inflation, geopolitics, trade wars, earnings season, oil/energy?
+5. WHAT TO WATCH: Follow-up events, data releases, or developments that could amplify or reverse the move.
 
-Assess this news headline's impact on the active {active_trade['direction']} ES position.
-Be specific: Is this bullish, bearish, or neutral for ES?
-If it SUPPORTS the trade → say "supports position, hold through"
-If it THREATENS the trade → say "threatens position, consider taking profit" or "tighten mental stop"
-If it creates volatility → say "expect chop, widen awareness"
-Keep it to 2-3 sentences. End with one of:
-[HIGH RISK] — directly threatens position, consider manual exit or take profit
-[MEDIUM RISK] — creates uncertainty, heighten awareness
-[LOW RISK] — unlikely to impact or supports current trade"""
+Keep it to 4-5 sentences. Be specific and actionable about ES impact.
+End with EXACTLY one of these tags:
+[HIGH IMPACT] — likely moves ES 20+ pts, major catalyst
+[MEDIUM IMPACT] — creates 5-15pt move or sustained sentiment shift  
+[LOW IMPACT] — noise, unlikely to move ES meaningfully"""
 
     try:
         response = requests.post(
             "https://api.anthropic.com/v1/messages",
             headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-20250514", "max_tokens": 200, "messages": [{"role": "user", "content": prompt}]},
+            json={"model": "claude-sonnet-4-6", "max_tokens": 300, "messages": [{"role": "user", "content": prompt}]},
             timeout=30
         )
         if response.status_code == 200:
             text = response.json()["content"][0]["text"]
             risk = "MEDIUM"
-            if "[HIGH RISK]" in text: risk = "HIGH"
-            elif "[LOW RISK]" in text: risk = "LOW"
-            clean = text.replace("[HIGH RISK]", "").replace("[MEDIUM RISK]", "").replace("[LOW RISK]", "").strip()
-            return clean, risk
+            if "[HIGH IMPACT]" in text: risk = "HIGH"
+            elif "[LOW IMPACT]" in text: risk = "LOW"
+            clean = text
+            for tag in ["[HIGH IMPACT]", "[MEDIUM IMPACT]", "[LOW IMPACT]"]:
+                clean = clean.replace(tag, "")
+            return clean.strip(), risk
+        else:
+            print(f"NEWS CLAUDE: API returned {response.status_code}: {response.text[:200]}")
     except Exception as e:
-        print(f"NEWS: Claude impact error: {e}")
+        print(f"NEWS: Claude error: {e}")
     return "", ""
 
 
 def analyze_news_opportunity(headline):
-    """Breaking news while FLAT → assess entry opportunity"""
-    if not ANTHROPIC_API_KEY or not ENABLE_CLAUDE:
-        return "", ""
-
-    prompt = f"""{SYSTEM_KNOWLEDGE}
-
-BREAKING NEWS DETECTED (currently FLAT — no open ES position):
-  Headline: {headline}
-
-Assess this news headline's impact on ES futures for someone with NO position:
-1. Is this bullish, bearish, or neutral for ES?
-2. Does this create a potential entry opportunity? If so, which direction?
-   e.g. "Bearish headline may create oversold dip — watch for LONG entry signal"
-   e.g. "Rate hike surprise — expect sustained selling, watch for SHORT entry"
-3. Key timing: Is the move likely immediate or will it develop over hours?
-4. Volatility warning if applicable
-Keep it to 2-3 sentences. End with one of:
-[OPPORTUNITY] — likely creates a tradeable move, watch for system entry signal
-[WATCH] — creates uncertainty, be ready for signals in either direction
-[NO ACTION] — unlikely to move ES meaningfully"""
-
-    try:
-        response = requests.post(
-            "https://api.anthropic.com/v1/messages",
-            headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-            json={"model": "claude-sonnet-4-20250514", "max_tokens": 200, "messages": [{"role": "user", "content": prompt}]},
-            timeout=30
-        )
-        if response.status_code == 200:
-            text = response.json()["content"][0]["text"]
-            level = "WATCH"
-            if "[OPPORTUNITY]" in text: level = "OPPORTUNITY"
-            elif "[NO ACTION]" in text: level = "NO ACTION"
-            clean = text.replace("[OPPORTUNITY]", "").replace("[WATCH]", "").replace("[NO ACTION]", "").strip()
-            return clean, level
-    except Exception as e:
-        print(f"NEWS: Claude opportunity error: {e}")
-    return "", ""
+    """Same as analyze_news_impact — unified prompt, no position needed"""
+    return analyze_news_impact(headline, None)
 
 
 def send_news_alert(headline, active_trade, analysis, risk_level):
-    """Send news alert to Discord — uses NEWS channel if configured, else main channel"""
+    """Send news alert to dedicated news Discord channel — pure ES market impact analysis"""
     news_webhook = NEWS_DISCORD_WEBHOOK_URL or DISCORD_WEBHOOK_URL
     if not news_webhook:
+        print("NEWS: No webhook URL configured")
         return
 
     risk_config = {
-        "HIGH":        {"emoji": "🚨", "color": 15548997, "label": "HIGH RISK"},
-        "MEDIUM":      {"emoji": "⚠️", "color": 16750848, "label": "MEDIUM RISK"},
-        "LOW":         {"emoji": "ℹ️", "color": 3447003,  "label": "LOW RISK"},
+        "HIGH":        {"emoji": "🚨", "color": 15548997, "label": "HIGH IMPACT"},
+        "MEDIUM":      {"emoji": "⚠️", "color": 16750848, "label": "MEDIUM IMPACT"},
+        "LOW":         {"emoji": "ℹ️", "color": 3447003,  "label": "LOW IMPACT"},
         "OPPORTUNITY": {"emoji": "🔔", "color": 5763719,  "label": "OPPORTUNITY"},
         "WATCH":       {"emoji": "👀", "color": 16750848, "label": "WATCH"},
         "NO ACTION":   {"emoji": "ℹ️", "color": 9807270,  "label": "NO ACTION"},
@@ -350,14 +316,6 @@ def send_news_alert(headline, active_trade, analysis, risk_level):
     lines.append(f"📰 **NEWS ALERT**")
     lines.append("")
     lines.append(f"**{headline}**")
-    lines.append("")
-
-    if active_trade:
-        dir_emoji = "🟢" if active_trade["direction"] == "LONG" else "🔴"
-        lines.append(f"Position: {dir_emoji} **{active_trade['direction']}** @ ${active_trade['price']:,.2f}")
-    else:
-        lines.append("Position: **FLAT** — no open trade")
-
     lines.append("")
     lines.append(f"{cfg['emoji']} **{cfg['label']}**")
     lines.append("────────────────────")
@@ -371,8 +329,8 @@ def send_news_alert(headline, active_trade, analysis, risk_level):
     }
 
     try:
-        requests.post(news_webhook, json={"embeds": [embed], "username": "OneMP11"}, timeout=10)
-        print(f"NEWS: Sent {risk_level} alert for: {headline[:60]}")
+        resp = requests.post(news_webhook, json={"embeds": [embed], "username": "OneMP11 News"}, timeout=10)
+        print(f"NEWS: Sent to {'NEWS channel' if NEWS_DISCORD_WEBHOOK_URL else 'main channel'} ({resp.status_code}): {headline[:50]}")
     except Exception as e:
         print(f"NEWS: Discord error: {e}")
 
@@ -1459,7 +1417,7 @@ Describe what you see on the chart in 1 sentence, then give your verdict."""}
                 "content-type": "application/json"
             },
             json={
-                "model": "claude-sonnet-4-20250514",
+                "model": "claude-sonnet-4-6",
                 "max_tokens": 300,
                 "messages": messages
             },
@@ -1942,7 +1900,7 @@ Be concise, use specific numbers."""
             response = requests.post(
                 "https://api.anthropic.com/v1/messages",
                 headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "content-type": "application/json"},
-                json={"model": "claude-sonnet-4-20250514", "max_tokens": 600, "messages": [{"role": "user", "content": prompt}]},
+                json={"model": "claude-sonnet-4-6", "max_tokens": 600, "messages": [{"role": "user", "content": prompt}]},
                 timeout=30
             )
             if response.status_code == 200:
