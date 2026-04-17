@@ -1,7 +1,7 @@
 """
-OneMP11 Alert Server V2.2 — Synced with V8.1b (no SL/Smart)
-Clean Discord format matching TradingView alert style.
-Database-driven Claude analysis + FinancialJuice news.
+OneMP11 Alert Server V3.0 — Synced with V8.1c
+V8.1c-only trade alerts + FinancialJuice news (separate channel).
+No multi-source — V8.1c is the edge. Everything else was noise.
 Deploy on Railway: https://railway.app
 """
 
@@ -400,10 +400,10 @@ def check_news_impact():
 
 
 # ===================================================
-# V8.1b KNOWLEDGE BASE (updated — no SL/Smart)
+# V8.1c KNOWLEDGE BASE
 # ===================================================
 SYSTEM_KNOWLEDGE = """
-You are the OneMP11 V8.1b trading system analyst for ES futures.
+You are the OneMP11 V8.1c trading system analyst for ES futures.
 Your job: assess each alert using the system's rules, database history, and market context.
 
 SIGNAL GENERATION:
@@ -844,197 +844,7 @@ def clear_all_alerts():
 
 
 # ===================================================
-# MULTI-SOURCE DETECTION
-# ===================================================
-def detect_source(raw_json):
-    """Detect which script sent the alert"""
-    if isinstance(raw_json, dict):
-        # SPY/VIX script sends embeds with title pattern "🟢 ES1! — BULLISH"
-        embeds = raw_json.get("embeds", [])
-        if embeds and isinstance(embeds, list) and len(embeds) > 0:
-            title = embeds[0].get("title", "")
-            if "BULLISH" in title or "BEARISH" in title or "TP HIT" in title:
-                return "SPY_VIX"
-        content = raw_json.get("content", "")
-        if "[RSI-PROFILE]" in content:
-            return "RSI_PROFILE"
-    return "V8_1B"
-
-
-def parse_spyvix_alert(raw_json):
-    """Parse SPY/VIX Discord TradeBot alert (embeds format)"""
-    data = {
-        "alert_type": "", "direction": "", "price": 0, "exit_pts": 0,
-        "rsi": 0, "vix_rsi": 0, "adx": -1, "verdict": "", "traffic": "",
-        "source": "SPY_VIX", "raw_json": json.dumps(raw_json),
-        "timestamp": datetime.utcnow().isoformat()
-    }
-    try:
-        embeds = raw_json.get("embeds", [{}])
-        embed = embeds[0] if embeds else {}
-        title = embed.get("title", "")
-
-        # TP Hit alert
-        if "TP HIT" in title:
-            data["alert_type"] = "SPY_VIX_TP"
-            data["direction"] = "LONG" if "LONG" in title else "SHORT"
-            for field in embed.get("fields", []):
-                val = field.get("value", "")
-                if "pts" in val:
-                    m = re.search(r'([+-]?\d+\.?\d*).*pts', val)
-                    if m:
-                        data["exit_pts"] = float(m.group(1))
-            return data
-
-        # Entry signal
-        if "BULLISH" in title:
-            data["alert_type"] = "SPY_VIX_ENTRY"
-            data["direction"] = "LONG"
-        elif "BEARISH" in title:
-            data["alert_type"] = "SPY_VIX_ENTRY"
-            data["direction"] = "SHORT"
-
-        # Extract confidence from title "🟢 ES1! — BULLISH (72%)"
-        conf_match = re.search(r'\((\d+)%\)', title)
-        if conf_match:
-            data["verdict"] = f"SPY/VIX Confidence: {conf_match.group(1)}%"
-
-        # Parse fields
-        for field in embed.get("fields", []):
-            name = field.get("name", "")
-            val = field.get("value", "")
-
-            if "Technical" in name:
-                rsi_m = re.search(r'SPY\s*(\d+)', val)
-                if rsi_m:
-                    data["rsi"] = float(rsi_m.group(1))
-                vix_m = re.search(r'VIX\s*(\d+)', val)
-                if vix_m:
-                    data["vix_rsi"] = float(vix_m.group(1))
-
-            elif "Levels" in name:
-                entry_m = re.search(r'Entry.*?\$(\d[\d,.]+)', val)
-                if entry_m:
-                    data["price"] = float(entry_m.group(1).replace(",", ""))
-
-            elif "HTF" in name:
-                htf_m = re.search(r'Alignment.*?(\d+)%', val)
-                if htf_m:
-                    data["traffic"] = f"HTF:{htf_m.group(1)}%"
-
-    except Exception as e:
-        data["alert_type"] = "SPY_VIX_PARSE_ERROR"
-        data["verdict"] = str(e)
-    return data
-
-
-def parse_rsi_profile_alert(raw_json):
-    """Parse RSI Profile Overlay alert"""
-    data = {
-        "alert_type": "", "direction": "", "price": 0,
-        "rsi": 0, "adx": -1, "verdict": "", "source": "RSI_PROFILE",
-        "raw_json": json.dumps(raw_json) if isinstance(raw_json, dict) else str(raw_json),
-        "timestamp": datetime.utcnow().isoformat()
-    }
-    try:
-        content = raw_json.get("content", "") if isinstance(raw_json, dict) else ""
-
-        if "TIER2 LONG" in content or "ZONE LONG" in content:
-            data["alert_type"] = "RSI_PROFILE_LONG"
-            data["direction"] = "LONG"
-        elif "TIER2 SHORT" in content or "ZONE SHORT" in content:
-            data["alert_type"] = "RSI_PROFILE_SHORT"
-            data["direction"] = "SHORT"
-        elif "TIER1 LONG" in content:
-            data["alert_type"] = "RSI_PROFILE_PENDING_LONG"
-            data["direction"] = "LONG"
-        elif "TIER1 SHORT" in content:
-            data["alert_type"] = "RSI_PROFILE_PENDING_SHORT"
-            data["direction"] = "SHORT"
-
-        # Parse data fields: RSI:58 POC:52 ADX:27 VWAP:6816.50
-        for pattern, key in [(r'RSI:(\d+)', 'rsi'), (r'ADX:(\d+)', 'adx'),
-                              (r'VWAP:\$?([\d,.]+)', 'price')]:
-            m = re.search(pattern, content)
-            if m:
-                data[key] = float(m.group(1).replace(",", ""))
-
-        # Zone range
-        zone_m = re.search(r'Zone:\s*\$([\d,.]+)-\$([\d,.]+)', content)
-        if zone_m:
-            data["verdict"] = f"Zone: ${zone_m.group(1)}-${zone_m.group(2)}"
-
-    except Exception as e:
-        data["alert_type"] = "RSI_PROFILE_PARSE_ERROR"
-        data["verdict"] = str(e)
-    return data
-
-
-def get_confluence_context(alert_data, minutes=15):
-    """Query DB for recent signals from OTHER sources for confluence analysis"""
-    source = alert_data.get("source", "V8_1B")
-    direction = alert_data.get("direction", "")
-    cutoff = (datetime.utcnow() - timedelta(minutes=minutes)).isoformat()
-
-    try:
-        conn = sqlite3.connect(DB_PATH)
-        c = conn.cursor()
-        c.execute("""
-            SELECT source, alert_type, direction, price, rsi, verdict, timestamp
-            FROM alerts
-            WHERE source != ? AND timestamp > ?
-            ORDER BY id DESC LIMIT 20
-        """, (source, cutoff))
-        rows = c.fetchall()
-        conn.close()
-
-        if not rows:
-            return "\nCROSS-INDICATOR CONFLUENCE: No recent signals from other indicators."
-
-        lines = ["\nCROSS-INDICATOR CONFLUENCE (last 15 min):"]
-        agrees = 0
-        disagrees = 0
-
-        for row in rows:
-            src, atype, dir, price, rsi, verdict, ts = row
-            src_label = {"SPY_VIX": "SPY/VIX TradeBot", "RSI_PROFILE": "RSI Profile", "V8_1B": "V8.1b"}.get(src, src)
-
-            # Check agreement
-            if direction and dir:
-                if dir == direction:
-                    agrees += 1
-                    emoji = "✅"
-                else:
-                    disagrees += 1
-                    emoji = "❌"
-            else:
-                emoji = "ℹ️"
-
-            time_str = ts[-8:-3] if len(ts) > 8 else ts
-            lines.append(f"  {emoji} {src_label}: {atype} {dir} (RSI:{rsi:.0f}) @ {time_str}")
-            if verdict:
-                lines.append(f"     {verdict}")
-
-        # Summary
-        total = agrees + disagrees
-        if total > 0:
-            if agrees > 0 and disagrees == 0:
-                lines.append(f"\n  🟢 ALL {agrees} indicator(s) AGREE with {direction} — STRONG confluence")
-            elif agrees > disagrees:
-                lines.append(f"\n  🟡 {agrees}/{total} agree, {disagrees} disagree — MODERATE confluence")
-            elif disagrees > agrees:
-                lines.append(f"\n  🔴 {disagrees}/{total} DISAGREE — WEAK confluence, consider skipping")
-            else:
-                lines.append(f"\n  🟡 Mixed signals — proceed with caution")
-
-        return "\n".join(lines)
-
-    except Exception as e:
-        return f"\nCONFLUENCE: Error querying — {e}"
-
-
-# ===================================================
-# ALERT PARSER (synced with V8.1b — fixed price/ADX)
+# ALERT PARSER (synced with V8.1c)
 # ===================================================
 def parse_alert(raw_json):
     data = {
@@ -1285,15 +1095,13 @@ def analyze_with_claude(alert_data, recent_alerts):
     pattern_context = get_pattern_analysis()
     similar = get_similar_trades(alert_data)
     news_context = get_news_context(max_items=5)
-    confluence_context = get_confluence_context(alert_data, minutes=15)
 
     recent_context = ""
     if recent_alerts:
         recent_context = "\nRecent alerts:\n"
         for a in recent_alerts[:10]:
             pts_tag = f" exit:{a.get('exit_pts', 0):+.1f}pts" if a.get('exit_pts', 0) != 0 else ""
-            src_tag = f" [{a.get('source', 'V8_1B')}]" if a.get('source', 'V8_1B') != 'V8_1B' else ""
-            recent_context += f"  {a.get('alert_type', '')} {a.get('direction', '')}{pts_tag}{src_tag} ({a.get('session', '')})\n"
+            recent_context += f"  {a.get('alert_type', '')} {a.get('direction', '')}{pts_tag} ({a.get('session', '')})\n"
 
     similar_context = ""
     if similar["direction_trades"] > 0:
@@ -1301,17 +1109,15 @@ def analyze_with_claude(alert_data, recent_alerts):
 
     adx_val = alert_data.get('adx', -1)
     adx_str = "N/A (not in this alert type)" if adx_val == -1 else str(adx_val)
-    source = alert_data.get('source', 'V8_1B')
 
     prompt = f"""{SYSTEM_KNOWLEDGE}
 
 {pattern_context}
 {similar_context}
 {recent_context}
-{confluence_context}
 {news_context}
 
-CURRENT ALERT (source: {source}):
+CURRENT ALERT:
   Type: {alert_data.get('alert_type', '')}
   Direction: {alert_data.get('direction', '')}
   Price: {alert_data.get('price', 0)}
@@ -1332,32 +1138,29 @@ CURRENT ALERT (source: {source}):
 
 INSTRUCTIONS — Be actionable. The trader needs to make money, not read essays.
 
-ALERT SOURCE MATTERS:
-- V8.1b alerts (ENTRY, RE_ENTRY, REVERSAL, MILESTONE, SESSION_CLOSE) = PRIMARY trading system
-  → These are the actual trades. Give TAKE IT / SKIP / HOLD / BANK / CUT verdicts.
-- RSI_PROFILE alerts (TIER1, TIER2, ZONE) = SUPPORTING context
-  → These are NOT separate trades. They tell you if RSI Profile agrees with V8.1b direction.
-  → If V8.1b has an active LONG and RSI Profile fires LONG → "confluence confirms your trade"
-  → If RSI Profile fires LONG but V8.1b hasn't entered → "RSI Profile sees opportunity, wait for V8.1b entry signal"
-  → NEVER tell the trader to enter based on RSI Profile alone
-- SPY_VIX alerts = SUPPORTING context
-  → Same rules as RSI Profile — confirms or warns, doesn't override V8.1b
-  → SPY/VIX confidence score is useful context for sizing, not for entry decisions
+ALERT TYPE HANDLING:
+- ENTRY / RE_ENTRY: Give TAKE IT or SKIP. Reference database stats for this direction + TL state + session.
+- REVERSAL: Confirm exit + new entry. Note if trend was exhausted (spread ratio, RSI).
+- MILESTONE_UP: HOLD or BANK PROFIT? Reference traffic light + ADR targets.
+- MILESTONE_DOWN: HOLD THROUGH or CUT LOSS? Is the trend intact?
+- ADR_R75/R100/R125 / ADR_S75/S100/S125: Bank or hold? Traffic light + ADX strength.
+- STOP_WARNING / CUT_WARNING / BANK_WARNING: EXIT DECISION — give clear CUT NOW or HOLD THROUGH or BANK NOW.
+  Analyze: trend structure, momentum, spread ratio, RSI, time of day, news. Be DECISIVE.
+- BANK_EXIT: Confirm exit. Note if re-entry conditions building.
+- SESSION_CLOSE / FRIDAY_CLOSE: Recap the trade result.
+- MARKET_CHECK / REGIME_SHIFT / NO_ENTRY / SESSION_OPEN: Brief market context.
 
 RESPONSE FORMAT:
-1. Start with VERDICT: "TAKE IT" / "SKIP" / "HOLD" / "BANK PROFIT" / "CUT LOSS" / "CONTEXT NOTED"
-   - Use "CONTEXT NOTED" for RSI_PROFILE and SPY_VIX alerts (they're not entries)
-   - For CONTEXT NOTED: state whether it agrees/disagrees with current V8.1b position
-2. One sentence explaining WHY (reference confluence + database stats)
-3. For V8.1b entries: check DB for recent RSI_PROFILE and SPY_VIX signals — do they agree?
-4. Keep it SHORT — 2-3 sentences max, no headers, no bullet lists
+1. Start with VERDICT: "TAKE IT" / "SKIP" / "HOLD" / "BANK PROFIT" / "CUT LOSS" / "CUT NOW" / "HOLD THROUGH" / "BANK NOW"
+2. One sentence WHY (reference specific database stats)
+3. One sentence on risk (traffic light + spread state + any news)
+4. 2-3 sentences max. No headers, no bullet lists.
 5. End with: [HIGH CONFIDENCE], [MEDIUM CONFIDENCE], or [LOW CONFIDENCE]
 
-CONFLUENCE SCORING (only for V8.1b entry/reversal alerts):
-- 3/3 indicators agree = HIGH confidence (mention "triple confluence")
-- 2/3 agree = MEDIUM confidence (note the disagreeing one)
-- 1/3 or 0/3 = LOW confidence (recommend skipping or reduced size)
-- No other signals recently = judge on V8.1b signal alone using database history"""
+CONFIDENCE RULES:
+- HIGH: Strong signal + database supports + traffic green + no adverse news
+- MEDIUM: Mostly aligned but one concern (extended TL, fading momentum, session risk)
+- LOW: Multiple concerns (low ADX, STRETCHED TL, RSI extreme, flow diverging, traffic red)"""
 
     try:
         # Chart Vision temporarily disabled — TradingView og:image returns
@@ -1389,7 +1192,7 @@ CANDLE COLORS (CVD Flow — buying/selling pressure):
 - Cyan→Orange = flow flipped bearish
 
 LINES ON CHART:
-- Green line (Kalman VWAP) = V8.1b's main trend line. Price above = bullish, below = bearish. Slope direction matters.
+- Green line (Kalman VWAP) = V8.1c's main trend line. Price above = bullish, below = bearish. Slope direction matters.
 - Blue line (EMA 26) = Short-term moving average for trend reference
 - RSI Trend Line Pro (changes color): Cyan = BULLISH slope, Purple = BEARISH slope, Yellow = NEUTRAL
 - RSI TL Pro Upper Band (dashed above) = Overbought envelope
@@ -1448,7 +1251,7 @@ Describe what you see on the chart in 1 sentence, then give your verdict."""}
 # DISCORD — CLEAN TEXT FORMAT (matches TV alert style)
 # ===================================================
 ALERT_STYLES = {
-    # V8.1b alerts
+    # V8.1c alerts
     "ENTRY":          {"emoji": "🟢", "color": 5763719,  "label": "ENTRY"},
     "RE_ENTRY":       {"emoji": "🔁", "color": 3447003,  "label": "RE-ENTRY"},
     "SESSION_CLOSE":  {"emoji": "⏸",  "color": 10070709, "label": "4PM CLOSE"},
@@ -1461,14 +1264,6 @@ ALERT_STYLES = {
     "REGIME_SHIFT":   {"emoji": "🌡️", "color": 16750848, "label": "REGIME SHIFT"},
     "NO_ENTRY":       {"emoji": "⏸",  "color": 16750848, "label": "NO-ENTRY ZONE"},
     "SESSION_OPEN":   {"emoji": "🔔", "color": 3066993,  "label": "SESSION OPEN"},
-    # RSI Profile alerts
-    "RSI_PROFILE_LONG":           {"emoji": "🎯", "color": 5763719,  "label": "RSI PROFILE — LONG CONFIRMED"},
-    "RSI_PROFILE_SHORT":          {"emoji": "🎯", "color": 15548997, "label": "RSI PROFILE — SHORT CONFIRMED"},
-    "RSI_PROFILE_PENDING_LONG":   {"emoji": "🔵", "color": 3447003,  "label": "RSI PROFILE — LONG PENDING"},
-    "RSI_PROFILE_PENDING_SHORT":  {"emoji": "🔵", "color": 15548997, "label": "RSI PROFILE — SHORT PENDING"},
-    # SPY/VIX alerts
-    "SPY_VIX_ENTRY":  {"emoji": "📊", "color": 3447003,  "label": "SPY/VIX SIGNAL"},
-    "SPY_VIX_TP":     {"emoji": "🎯", "color": 5763719,  "label": "SPY/VIX TP HIT"},
     # News
     "NEWS_IMPACT":    {"emoji": "📰", "color": 16750848, "label": "NEWS ALERT"},
     # ADR target alerts
@@ -1616,15 +1411,14 @@ def build_discord_payload(alert_data, claude_analysis="", claude_confidence="", 
     description = "\n".join(lines)
 
     # Add chart link for quick access (only for actionable alerts)
-    actionable = ["ENTRY", "RE_ENTRY", "REVERSAL", "MILESTONE_UP", "MILESTONE_DOWN",
-                   "SPY_VIX_ENTRY", "RSI_PROFILE_LONG", "RSI_PROFILE_SHORT"]
+    actionable = ["ENTRY", "RE_ENTRY", "REVERSAL", "MILESTONE_UP", "MILESTONE_DOWN", "BANK_EXIT"]
     if CHART_URL and atype in actionable:
         description += f"\n\n📊 [Live Chart]({CHART_URL})"
 
     main_embed = {
         "description": description,
         "color": color,
-        "footer": {"text": "⚡ © 2026 OneMP11 V8.1b"},
+        "footer": {"text": "⚡ © 2026 OneMP11 V8.1c"},
         "timestamp": datetime.utcnow().strftime("%Y-%m-%dT%H:%M:%S.000Z")
     }
 
@@ -1691,22 +1485,16 @@ def health():
         pass
     return jsonify({
         "status": "running", "service": "OneMP11 Alert Server",
-        "version": "2.2 (V8.1b + SPY/VIX + RSI Profile)", "claude": ENABLE_CLAUDE,
+        "version": "3.0 (V8.1c only)", "claude": ENABLE_CLAUDE,
         "discord": bool(DISCORD_WEBHOOK_URL), "db_ok": db_ok, "db_path": DB_PATH,
         "db_alerts": db_count, "stats_7d": get_stats(7)
     })
 
 
-def process_alert_background(raw, source):
-    """Background thread: Claude analysis + DB store + Discord forward"""
+def process_alert_background(raw):
+    """Background thread: parse V8.1c alert → Claude analysis → DB store → Discord"""
     try:
-        if source == "SPY_VIX":
-            alert_data = parse_spyvix_alert(raw)
-        elif source == "RSI_PROFILE":
-            alert_data = parse_rsi_profile_alert(raw)
-        else:
-            alert_data = parse_alert(raw)
-
+        alert_data = parse_alert(raw)
         recent = get_recent_alerts(10)
 
         claude_analysis, claude_confidence = "", ""
@@ -1719,18 +1507,13 @@ def process_alert_background(raw, source):
 
         store_alert(alert_data)
         forward_to_discord(alert_data, claude_analysis, claude_confidence)
-        print(f"BG: Processed {source}/{alert_data['alert_type']} → {claude_confidence or 'no analysis'}")
+        print(f"BG: Processed {alert_data['alert_type']} → {claude_confidence or 'no analysis'}")
     except Exception as e:
-        print(f"BG ERROR processing {source}: {e}")
+        print(f"BG ERROR: {e}")
         traceback.print_exc()
         # Still try to forward raw alert to Discord even if Claude fails
         try:
-            if source == "SPY_VIX":
-                alert_data = parse_spyvix_alert(raw)
-            elif source == "RSI_PROFILE":
-                alert_data = parse_rsi_profile_alert(raw)
-            else:
-                alert_data = parse_alert(raw)
+            alert_data = parse_alert(raw)
             store_alert(alert_data)
             forward_to_discord(alert_data)
         except Exception:
@@ -1747,14 +1530,11 @@ def webhook():
         except Exception:
             return jsonify({"error": "Invalid JSON"}), 400
 
-    # Detect source immediately (fast — no API calls)
-    source = detect_source(raw)
-
     # Return 200 OK to TradingView IMMEDIATELY — process in background
-    t = threading.Thread(target=process_alert_background, args=(raw, source), daemon=True)
+    t = threading.Thread(target=process_alert_background, args=(raw,), daemon=True)
     t.start()
 
-    return jsonify({"status": "accepted", "source": source}), 200
+    return jsonify({"status": "accepted"}), 200
 
 
 @app.route("/test-webhook", methods=["POST"])
@@ -1767,7 +1547,7 @@ def test_webhook():
         except Exception:
             return jsonify({"error": "Invalid JSON"}), 400
 
-    alert_data = parse_alert(raw) if detect_source(raw) == "V8_1B" else (parse_spyvix_alert(raw) if detect_source(raw) == "SPY_VIX" else parse_rsi_profile_alert(raw))
+    alert_data = parse_alert(raw)
     recent = get_recent_alerts(10)
 
     claude_analysis, claude_confidence = "", ""
