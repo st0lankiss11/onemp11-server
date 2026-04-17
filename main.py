@@ -8,11 +8,11 @@ Deploy on Railway: https://railway.app
 import os
 import json
 import re
-import sqlite3
 import time
 import traceback
 import threading
 import feedparser
+import mysql.connector
 from datetime import datetime, timedelta
 from flask import Flask, request, jsonify
 import requests
@@ -29,10 +29,32 @@ print(f"CONFIG: News webhook: {'SET' if NEWS_DISCORD_WEBHOOK_URL else 'NOT SET (
 ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 WEBHOOK_SECRET      = os.environ.get("WEBHOOK_SECRET", "onemp11")
 ENABLE_CLAUDE       = os.environ.get("ENABLE_CLAUDE", "true").lower() == "true"
-DB_PATH             = os.environ.get("DB_PATH", "/data/alerts.db")
 
-# Ensure DB directory exists (Railway volumes mount at /data)
-os.makedirs(os.path.dirname(DB_PATH) if os.path.dirname(DB_PATH) else ".", exist_ok=True)
+# MySQL configuration (Railway MySQL service)
+MYSQL_HOST     = os.environ.get("MYSQLHOST", "localhost")
+MYSQL_USER     = os.environ.get("MYSQLUSER", "root")
+MYSQL_PASSWORD = os.environ.get("MYSQLPASSWORD", "")
+MYSQL_DATABASE = os.environ.get("MYSQLDATABASE", "railway")
+MYSQL_PORT     = int(os.environ.get("MYSQLPORT", "3306"))
+
+print(f"CONFIG: MySQL host: {MYSQL_HOST}, db: {MYSQL_DATABASE}")
+
+
+# ===================================================
+# MYSQL CONNECTION HELPER
+# ===================================================
+def get_db_connection():
+    """Return a new MySQL connection. Caller is responsible for closing it."""
+    return mysql.connector.connect(
+        host=MYSQL_HOST,
+        user=MYSQL_USER,
+        password=MYSQL_PASSWORD,
+        database=MYSQL_DATABASE,
+        port=MYSQL_PORT,
+        connection_timeout=10,
+        autocommit=False,
+    )
+
 
 # ===================================================
 # FINANCIALJUICE NEWS FEED
@@ -150,12 +172,12 @@ def get_headline_key(headline):
 def was_recently_alerted(headline_key):
     """Check if we already alerted on a similar headline recently (DB-backed, survives restarts)"""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         cutoff = (datetime.utcnow() - timedelta(minutes=NEWS_COOLDOWN_MINUTES * 3)).isoformat()
         c.execute("""
             SELECT verdict FROM alerts
-            WHERE alert_type = 'NEWS_IMPACT' AND timestamp > ?
+            WHERE alert_type = 'NEWS_IMPACT' AND timestamp > %s
             ORDER BY id DESC LIMIT 10
         """, (cutoff,))
         recent_news = c.fetchall()
@@ -178,10 +200,10 @@ def news_on_cooldown():
     if time.time() - _last_news_alert_time < NEWS_COOLDOWN_MINUTES * 60:
         return True
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         cutoff = (datetime.utcnow() - timedelta(minutes=NEWS_COOLDOWN_MINUTES)).isoformat()
-        c.execute("SELECT COUNT(*) FROM alerts WHERE alert_type = 'NEWS_IMPACT' AND timestamp > ?", (cutoff,))
+        c.execute("SELECT COUNT(*) FROM alerts WHERE alert_type = 'NEWS_IMPACT' AND timestamp > %s", (cutoff,))
         count = c.fetchone()[0]
         conn.close()
         return count > 0
@@ -192,7 +214,7 @@ def news_on_cooldown():
 def get_active_trade():
     """Query DB for most recent active trade (entry without matching exit)"""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         # Get last entry/re-entry/reversal
         c.execute("""
@@ -225,7 +247,7 @@ def get_active_trade():
         return {
             "direction": last_entry[1],
             "price": last_entry[2],
-            "timestamp": last_entry[3],
+            "timestamp": str(last_entry[3]),
             "tl_state": last_entry[4],
             "rsi": last_entry[5],
             "adx": last_entry[6],
@@ -519,43 +541,30 @@ CONFIDENCE RULES:
 # ===================================================
 def init_db():
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute("""
             CREATE TABLE IF NOT EXISTS alerts (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                timestamp TEXT, alert_type TEXT, direction TEXT, price REAL,
-                exit_pts REAL, daily_pnl REAL, weekly_pnl REAL, monthly_pnl REAL,
-                total_pnl REAL, tl_spread REAL, tl_state TEXT, rsi REAL,
-                vix_rsi REAL, compare_rsi REAL, adx REAL, verdict TEXT,
-                claude_analysis TEXT, claude_confidence TEXT, raw_json TEXT, session TEXT,
-                cvd_mom REAL DEFAULT 0, histogram REAL DEFAULT 0,
-                kalman_slope REAL DEFAULT 0, candle_color TEXT DEFAULT '',
-                traffic TEXT DEFAULT '', regime TEXT DEFAULT '',
-                spread_ratio REAL DEFAULT 0, open_pnl REAL DEFAULT 0,
-                source TEXT DEFAULT 'V8_1B'
+                id INT AUTO_INCREMENT PRIMARY KEY,
+                timestamp VARCHAR(50), alert_type VARCHAR(50), direction VARCHAR(20), price DOUBLE,
+                exit_pts DOUBLE, daily_pnl DOUBLE, weekly_pnl DOUBLE, monthly_pnl DOUBLE,
+                total_pnl DOUBLE, tl_spread DOUBLE, tl_state VARCHAR(20), rsi DOUBLE,
+                vix_rsi DOUBLE, compare_rsi DOUBLE, adx DOUBLE, verdict TEXT,
+                claude_analysis TEXT, claude_confidence VARCHAR(20), raw_json MEDIUMTEXT,
+                session VARCHAR(20),
+                cvd_mom DOUBLE DEFAULT 0, histogram DOUBLE DEFAULT 0,
+                kalman_slope DOUBLE DEFAULT 0, candle_color VARCHAR(30) DEFAULT '',
+                traffic VARCHAR(50) DEFAULT '', regime VARCHAR(30) DEFAULT '',
+                spread_ratio DOUBLE DEFAULT 0, open_pnl DOUBLE DEFAULT 0,
+                source VARCHAR(20) DEFAULT 'V8_1B'
             )
         """)
-        # Migration for existing DBs — add new columns if missing
-        new_cols = [
-            ("session", "TEXT DEFAULT ''"), ("cvd_mom", "REAL DEFAULT 0"),
-            ("histogram", "REAL DEFAULT 0"), ("kalman_slope", "REAL DEFAULT 0"),
-            ("candle_color", "TEXT DEFAULT ''"), ("traffic", "TEXT DEFAULT ''"),
-            ("regime", "TEXT DEFAULT ''"), ("spread_ratio", "REAL DEFAULT 0"),
-            ("open_pnl", "REAL DEFAULT 0"),
-            ("source", "TEXT DEFAULT 'V8_1B'"),
-        ]
-        for col, ctype in new_cols:
-            try:
-                c.execute(f"ALTER TABLE alerts ADD COLUMN {col} {ctype}")
-            except sqlite3.OperationalError:
-                pass
         conn.commit()
         conn.close()
-        print(f"DB: Initialized at {DB_PATH}")
+        print(f"DB: MySQL initialized at {MYSQL_HOST}/{MYSQL_DATABASE}")
 
-        # Verify write works
-        conn = sqlite3.connect(DB_PATH)
+        # Verify connection and count
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM alerts")
         count = c.fetchone()[0]
@@ -592,7 +601,7 @@ def store_alert(data):
     atype = data.get("alert_type", "UNKNOWN")
     source = data.get("source", "V8_1B")
     try:
-        conn = sqlite3.connect(DB_PATH, timeout=10)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute("""
             INSERT INTO alerts (
@@ -602,7 +611,7 @@ def store_alert(data):
                 adx, verdict, claude_analysis, claude_confidence, raw_json, session,
                 cvd_mom, histogram, kalman_slope, candle_color, traffic, regime,
                 spread_ratio, open_pnl, source
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ) VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
         """, (
             data.get("timestamp", ""), data.get("alert_type", ""),
             data.get("direction", ""), data.get("price", 0),
@@ -632,22 +641,26 @@ def store_alert(data):
 
 
 def get_recent_alerts(n=10):
-    conn = sqlite3.connect(DB_PATH)
-    c = conn.cursor()
-    c.execute("SELECT * FROM alerts ORDER BY id DESC LIMIT ?", (n,))
+    conn = get_db_connection()
+    c = conn.cursor(dictionary=True)
+    c.execute("SELECT * FROM alerts ORDER BY id DESC LIMIT %s", (n,))
     rows = c.fetchall()
-    cols = [desc[0] for desc in c.description]
     conn.close()
-    return [dict(zip(cols, row)) for row in rows]
+    # Convert any non-serialisable types (e.g. Decimal, datetime) to plain Python
+    result = []
+    for row in rows:
+        result.append({k: (str(v) if not isinstance(v, (int, float, str, bool, type(None))) else v)
+                       for k, v in row.items()})
+    return result
 
 
 def get_stats(days=7):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
     cutoff = (datetime.utcnow() - timedelta(days=days)).isoformat()
     c.execute("""
         SELECT alert_type, direction, exit_pts, claude_confidence, session
-        FROM alerts WHERE timestamp > ? AND exit_pts != 0
+        FROM alerts WHERE timestamp > %s AND exit_pts != 0
         ORDER BY id DESC
     """, (cutoff,))
     rows = c.fetchall()
@@ -690,7 +703,7 @@ def get_stats(days=7):
 
 
 def get_session_stats():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("""
         SELECT timestamp, alert_type, direction, exit_pts, claude_confidence, session
@@ -723,17 +736,17 @@ def get_session_stats():
 
 
 def get_similar_trades(alert_data, limit=30):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
     direction = alert_data.get("direction", "")
     tl_state = alert_data.get("tl_state", "")
     session = get_session_from_time(alert_data.get("timestamp", ""))
 
-    c.execute("SELECT alert_type, direction, exit_pts, tl_state, rsi, adx, claude_confidence, session FROM alerts WHERE direction = ? AND exit_pts != 0 ORDER BY id DESC LIMIT ?", (direction, limit))
+    c.execute("SELECT alert_type, direction, exit_pts, tl_state, rsi, adx, claude_confidence, session FROM alerts WHERE direction = %s AND exit_pts != 0 ORDER BY id DESC LIMIT %s", (direction, limit))
     all_dir = c.fetchall()
-    c.execute("SELECT exit_pts FROM alerts WHERE tl_state = ? AND exit_pts != 0 ORDER BY id DESC LIMIT ?", (tl_state, limit))
+    c.execute("SELECT exit_pts FROM alerts WHERE tl_state = %s AND exit_pts != 0 ORDER BY id DESC LIMIT %s", (tl_state, limit))
     tl_trades = c.fetchall()
-    c.execute("SELECT exit_pts FROM alerts WHERE session = ? AND exit_pts != 0 ORDER BY id DESC LIMIT ?", (session, limit))
+    c.execute("SELECT exit_pts FROM alerts WHERE session = %s AND exit_pts != 0 ORDER BY id DESC LIMIT %s", (session, limit))
     sess_trades = c.fetchall()
     conn.close()
 
@@ -760,7 +773,7 @@ def get_similar_trades(alert_data, limit=30):
 
 
 def get_pattern_analysis():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("SELECT alert_type, direction, exit_pts, tl_state, rsi, adx, claude_confidence, session FROM alerts WHERE exit_pts != 0 ORDER BY id DESC LIMIT 50")
     trades = c.fetchall()
@@ -824,9 +837,9 @@ def get_pattern_analysis():
 
 
 def delete_alert(alert_id):
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
-    c.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
+    c.execute("DELETE FROM alerts WHERE id = %s", (alert_id,))
     deleted = c.rowcount
     conn.commit()
     conn.close()
@@ -834,7 +847,7 @@ def delete_alert(alert_id):
 
 
 def clear_all_alerts():
-    conn = sqlite3.connect(DB_PATH)
+    conn = get_db_connection()
     c = conn.cursor()
     c.execute("DELETE FROM alerts")
     count = c.rowcount
@@ -1475,7 +1488,7 @@ def health():
     db_ok = False
     db_count = 0
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM alerts")
         db_count = c.fetchone()[0]
@@ -1486,7 +1499,8 @@ def health():
     return jsonify({
         "status": "running", "service": "OneMP11 Alert Server",
         "version": "3.0 (V8.1c only)", "claude": ENABLE_CLAUDE,
-        "discord": bool(DISCORD_WEBHOOK_URL), "db_ok": db_ok, "db_path": DB_PATH,
+        "discord": bool(DISCORD_WEBHOOK_URL), "db_ok": db_ok,
+        "db_host": MYSQL_HOST, "db_name": MYSQL_DATABASE,
         "db_alerts": db_count, "stats_7d": get_stats(7)
     })
 
@@ -1610,34 +1624,16 @@ def news():
     return jsonify({"enabled": ENABLE_NEWS, "headlines": items, "count": len(items)})
 
 
-@app.route("/download-db", methods=["GET"])
-def download_db():
-    """Download the SQLite database file for offline analysis"""
-    secret = request.args.get("secret", "")
-    if secret != WEBHOOK_SECRET:
-        return jsonify({"error": "Add ?secret=your_webhook_secret to download"}), 403
-    try:
-        import shutil
-        from flask import send_file
-        # Copy to temp file (avoid locking issues)
-        tmp_path = DB_PATH + ".download"
-        shutil.copy2(DB_PATH, tmp_path)
-        return send_file(tmp_path, as_attachment=True, download_name="onemp11_alerts.db",
-                         mimetype="application/x-sqlite3")
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-
 @app.route("/db-stats", methods=["GET"])
 def db_stats():
     """Quick database health check — row counts by source and type"""
     try:
-        conn = sqlite3.connect(DB_PATH)
+        conn = get_db_connection()
         c = conn.cursor()
         c.execute("SELECT COUNT(*) FROM alerts")
         total = c.fetchone()[0]
-        c.execute("SELECT source, COUNT(*) FROM alerts GROUP BY source")
-        by_source = {row[0] or "V8_1B": row[1] for row in c.fetchall()}
+        c.execute("SELECT COALESCE(source, 'V8_1B'), COUNT(*) FROM alerts GROUP BY source")
+        by_source = {row[0]: row[1] for row in c.fetchall()}
         c.execute("SELECT alert_type, COUNT(*) FROM alerts GROUP BY alert_type ORDER BY COUNT(*) DESC")
         by_type = {row[0]: row[1] for row in c.fetchall()}
         c.execute("SELECT MIN(timestamp), MAX(timestamp) FROM alerts")
@@ -1647,8 +1643,10 @@ def db_stats():
             "total_alerts": total,
             "by_source": by_source,
             "by_type": by_type,
-            "first_alert": date_range[0],
-            "last_alert": date_range[1],
+            "first_alert": str(date_range[0]) if date_range[0] else None,
+            "last_alert": str(date_range[1]) if date_range[1] else None,
+            "db_host": MYSQL_HOST,
+            "db_name": MYSQL_DATABASE,
         })
     except Exception as e:
         return jsonify({"error": str(e)}), 500
