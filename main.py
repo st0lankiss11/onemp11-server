@@ -23,9 +23,9 @@ app = Flask(__name__)
 # CONFIG
 # ===================================================
 DISCORD_WEBHOOK_URL = os.environ.get("DISCORD_WEBHOOK_URL", "")
-NEWS_DISCORD_WEBHOOK_URL = os.environ.get("NEWS_DISCORD_WEBHOOK_URL", "")  # Separate channel for news
+News_Discord_Webhook = os.environ.get("News_Discord_Webhook", "")  # Separate channel for news
 print(f"CONFIG: Main webhook: {'SET' if DISCORD_WEBHOOK_URL else 'NOT SET'}")
-print(f"CONFIG: News webhook: {'SET' if NEWS_DISCORD_WEBHOOK_URL else 'NOT SET (using main channel)'}")
+print(f"CONFIG: News webhook: {'SET' if News_Discord_Webhook else 'NOT SET (using main channel)'}")
 ANTHROPIC_API_KEY   = os.environ.get("ANTHROPIC_API_KEY", "")
 WEBHOOK_SECRET      = os.environ.get("WEBHOOK_SECRET", "onemp11")
 ENABLE_CLAUDE       = os.environ.get("ENABLE_CLAUDE", "true").lower() == "true"
@@ -297,7 +297,7 @@ def analyze_news_opportunity(headline):
 
 def send_news_alert(headline, active_trade, analysis, risk_level):
     """Send news alert to dedicated news Discord channel — pure ES market impact analysis"""
-    news_webhook = NEWS_DISCORD_WEBHOOK_URL or DISCORD_WEBHOOK_URL
+    news_webhook = News_Discord_Webhook or DISCORD_WEBHOOK_URL
     if not news_webhook:
         print("NEWS: No webhook URL configured")
         return
@@ -330,7 +330,7 @@ def send_news_alert(headline, active_trade, analysis, risk_level):
 
     try:
         resp = requests.post(news_webhook, json={"embeds": [embed], "username": "OneMP11 News"}, timeout=10)
-        print(f"NEWS: Sent to {'NEWS channel' if NEWS_DISCORD_WEBHOOK_URL else 'main channel'} ({resp.status_code}): {headline[:50]}")
+        print(f"NEWS: Sent to {'NEWS channel' if News_Discord_Webhook else 'main channel'} ({resp.status_code}): {headline[:50]}")
     except Exception as e:
         print(f"NEWS: Discord error: {e}")
 
